@@ -413,6 +413,57 @@ extern "C" int gt6_no_spu_post(void)
     }
     return on;
 }
+
+/* ---------------------------------------------------------------------------
+ * GT6_ASPECT: ultrawide / custom 3D aspect ratio (BCES01893 1.22, 0x008A615C).
+ * Mirrors AlexHaust's RPCS3 Aspect Ratio patch: when the game's aspect getter
+ * returns a 16:9 ratio in [1.70, 1.85] in f1, substitute g_gt6_aspect.
+ * -------------------------------------------------------------------------*/
+extern "C" float g_gt6_aspect = 0.0f;
+
+void gt6_aspect_override(ppu_context* ctx)
+{
+    const float target = g_gt6_aspect;
+    if (target > 0.5f && ctx->fpr[1] >= 1.70 && ctx->fpr[1] <= 1.85) {
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "[gt6-aspect] 0x008A615C hook active: %.4f -> %.4f\n",
+                    (double)ctx->fpr[1], (double)target);
+        }
+        ctx->fpr[1] = (double)target;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * GT6_LAN / GT6_DEV_MENU: hidden LAN mode patches (BCES01893 1.22).
+ *   - 0x0081715C (Develop Settings): unlocks R1+SELECT Develop Settings menu
+ *   - 0x00A0BDAC & 0x00A0BF50 (LAN Room Sync Without PSN): follow network_up
+ *   - 0x00B69768 (LAN Host Member Info): copy peer name/IP/MAC into member slot
+ * -------------------------------------------------------------------------*/
+extern "C" int g_gt6_lan = 0;
+extern "C" int g_gt6_dev_menu = 0;
+
+int gt6_lan_on(void)      { return g_gt6_lan; }
+int gt6_dev_menu_on(void) { return g_gt6_dev_menu; }
+
+void gt6_lan_member_info(ppu_context* ctx)
+{
+    if (!g_gt6_lan) return;
+    uint32_t r11 = vm_read32((uint32_t)ctx->gpr[31] + 0x18u);
+    if (!r11) return;
+    r11 = vm_read32(r11 + 0xBCu);
+    if (!r11) return;
+    const uint32_t r29 = (uint32_t)ctx->gpr[29];
+    const uint32_t peer_id = vm_read16(r29);
+    for (int i = 0; i < 0x40; i++, r11 += 0x70u) {
+        if (vm_read8(r11 + 0x69u) == 0) continue;
+        if (vm_read32(r11 + 0x40u) != peer_id) continue;
+        for (uint32_t off = 0; off < 0x30u; off += 8u)
+            vm_write64(r11 + off, vm_read64(r29 + 0x70u + off));
+        break;
+    }
+}
 /* r3 = display buffer descriptor, r4 = scene buffer descriptor: { u32 address, u32 pitch, ..., u16 width @0x14,
  * u16 height @0x16, u16 viewport x0 @0x18, y0 @0x1A, x1 @0x1C, y1 @0x1E }. Sets up
  * func_00C3E050(dst address, dst pitch, dst x, dst y, src address, src pitch, src x, src y, width, height, 4)

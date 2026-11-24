@@ -155,6 +155,8 @@ namespace GT6Launcher
             var chips = new WrapPanel { MaxWidth = 600, Margin = new Thickness(0, 0, 0, 18) };
             chips.Children.Add(files.Ready ? Ui.Chip("", L.T("게임 파일 확인됨"), Ui.Brush("Good")) : Ui.Chip("", L.T("게임 파일 부족"), Ui.Brush("Warn")));
             chips.Children.Add(Ui.Chip("", SettingsPage.ResolutionName(fullHd, realRes), fullHd ? Ui.Brush("Accent") : Ui.Brush("SubText")));
+            if (build.Lan && Launcher.On("LanMode"))
+                chips.Children.Add(Ui.Chip("", "LAN", Ui.Brush("Good")));
             List<ModInfo> mods = ModStore.List(Launcher);
             int on = mods.Count(m => m.Enabled && m.Root != null);
             int inGame = GameMods.List(Launcher, false).Count;   // mods inside the game data itself: always applied
@@ -295,6 +297,108 @@ namespace GT6Launcher
             return Ui.ToggleRow(label, hint, Launcher.On(key), delegate(bool on) { Launcher.SetSetting(key, on ? "1" : "0"); });
         }
 
+        static double ResolvedAspect(string setting)
+        {
+            if (string.IsNullOrEmpty(setting))
+                return 0;
+            if (string.Equals(setting, "auto", StringComparison.OrdinalIgnoreCase))
+            {
+                int w = System.Windows.Forms.Screen.PrimaryScreen.Bounds.Width;
+                int h = System.Windows.Forms.Screen.PrimaryScreen.Bounds.Height;
+                if (w > 0 && h > 0)
+                {
+                    double ma = (double)w / h;
+                    if (Math.Abs(ma / (16.0 / 9.0) - 1.0) > 0.01)
+                        return ma;
+                }
+                return 0;
+            }
+            double v;
+            return double.TryParse(setting, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v) && v >= 1.0 && v <= 6.0 ? v : 0;
+        }
+
+        static string[] LocalAdapterPairs(string current)
+        {
+            var pairs = new List<string> { "", L.T("자동") };
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up)
+                        continue;
+                    if (ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback)
+                        continue;
+                    foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+                            continue;
+                        string ip = ua.Address.ToString();
+                        if (ip.StartsWith("127.") || ip.StartsWith("169.254.") || !seen.Add(ip))
+                            continue;
+                        pairs.Add(ip);
+                        pairs.Add(ip + " — " + ni.Name);
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            if (!string.IsNullOrEmpty(current) && !seen.Contains(current))
+            {
+                pairs.Add(current);
+                pairs.Add(current);
+            }
+            return pairs.ToArray();
+        }
+
+        Border LanCard(GameBuild build, bool running)
+        {
+            var stack = new StackPanel { IsEnabled = !running, Opacity = running ? 0.5 : 1 };
+            if (!build.Lan)
+            {
+                stack.Children.Add(Ui.Text(L.T("이 빌드에는 LAN 모드 패치가 들어 있지 않습니다."), "Caption"));
+                return Ui.Card(L.T("LAN 멀티플레이"), stack);
+            }
+            stack.Children.Add(Toggle("LanMode", L.T("LAN 모드 (lanmode · PSN 없음)"),
+                L.T("GT6의 숨겨진 LAN 모드와 방 동기화·멤버 정보 패치, 로컬 네트워크(TCP 20000, UDP 20123~20125)를 켭니다. 오픈 로비를 바로 열려면 마이 홈에서 R1 + SELECT → Develop Settings → Tutorial → Complete All을 실행하세요.")));
+            string curBind = Launcher.Setting("LanBind");
+            FrameworkElement bindRow = Ui.Setting(L.T("네트워크 어댑터 (바인드 IP)"),
+                L.T("어댑터가 여러 개인 PC(VPN · WSL · Wi-Fi/유선 등)에서 LAN 브로드캐스트를 보낼 주소를 고릅니다."),
+                Ui.Choices(curBind, delegate(string v) { Launcher.SetSetting("LanBind", v); }, LocalAdapterPairs(curBind)));
+            bindRow.Margin = new Thickness(0, 8, 0, 8);
+            stack.Children.Add(bindRow);
+
+            var nameBox = new TextBox
+            {
+                Text = Launcher.Setting("LanName"),
+                MaxLength = 16,
+                Width = 260,
+                HorizontalAlignment = HorizontalAlignment.Right,
+            };
+            Action saveName = delegate
+            {
+                string clean = System.Text.RegularExpressions.Regex.Replace(nameBox.Text ?? "", @"[^A-Za-z0-9_\-]", "");
+                if (clean.Length > 16) clean = clean.Substring(0, 16);
+                if (clean != nameBox.Text) nameBox.Text = clean;
+                Launcher.SetSetting("LanName", clean);
+            };
+            nameBox.LostFocus += delegate { saveName(); };
+            nameBox.KeyDown += delegate(object sender, System.Windows.Input.KeyEventArgs e)
+            {
+                if (e.Key == System.Windows.Input.Key.Enter) { saveName(); Window.Toast(L.T("LAN 이름을 저장했습니다.")); }
+            };
+            FrameworkElement nameRow = Ui.Setting(L.T("LAN 플레이어 이름"),
+                L.T("로비에 표시되는 이름이며, 이 이름으로 PC마다 고유한 MAC 주소와 콘솔 PSID가 만들어집니다. 비워 두면 PC 이름을 씁니다."),
+                nameBox);
+            nameRow.Margin = new Thickness(0, 4, 0, 8);
+            stack.Children.Add(nameRow);
+
+            stack.Children.Add(Toggle("DevMenu", L.T("개발자 설정 (R1 + SELECT)"),
+                L.T("마이 홈에서 R1 + SELECT로 Develop Settings 메뉴를 엽니다. LAN 모드가 켜져 있으면 자동으로 함께 켜집니다.")));
+            return Ui.Card(L.T("LAN 멀티플레이"), stack);
+        }
+
         // How the home page's chip names the resolution (realRes as in MenuSettings.RealRes).
         public static string ResolutionName(bool fullHd, int realRes)
         {
@@ -325,9 +429,13 @@ namespace GT6Launcher
             };
             if (build.RealRes)
             {
-                items.Add(new[] { "2", L.T("1080p 선명"), "1920×1080" });
-                items.Add(new[] { "3", "1440p", "2560×1440" });
-                items.Add(new[] { "4", "4K", "3840×2160" });
+                double asp = ResolvedAspect(Launcher.Setting("Aspect"));
+                int w1080 = asp > 0.5 ? (((int)Math.Round(1080 * asp) + 1) & ~1) : 1920;
+                int w1440 = asp > 0.5 ? (((int)Math.Round(1440 * asp) + 1) & ~1) : 2560;
+                int w2160 = asp > 0.5 ? Math.Min(7680, (((int)Math.Round(2160 * asp) + 1) & ~1)) : 3840;
+                items.Add(new[] { "2", L.T("1080p 선명"), w1080 + "×1080" });
+                items.Add(new[] { "3", "1440p", w1440 + "×1440" });
+                items.Add(new[] { "4", "4K", w2160 + "×2160" });
             }
             int height = PcInfo.MonitorHeight();
             string fits = !build.RealRes ? (height >= 1080 ? "1" : "0") : height >= 2160 ? "4" : height >= 1440 ? "3" : height >= 1080 ? "2" : "0";
@@ -424,6 +532,22 @@ namespace GT6Launcher
                 screen.Children.Add(Ui.Text(build.Available ? build.ExeName + L.T("는 Full HD 스위치가 생기기 전의 빌드입니다 (720p). 시험판에서 쓸 수 있습니다.") : L.T("빌드를 찾지 못했습니다."), "Caption"));
 
             // Anti-aliasing and full screen are the launcher's own switches for a run (Settings.Overrides: GT6_AA, GT6_FULLSCREEN).
+            if (build.Ultrawide)
+            {
+                FrameworkElement aspect = Ui.Setting(L.T("화면 비율 (울트라와이드)"),
+                    L.T("3D 시야를 선택한 비율로 넓히고 실제 해상도의 가로 픽셀도 맞춥니다 (예: 1440p에서 3440×1440). 2D 메뉴와 HUD는 가로로 늘어납니다. 게임을 시작할 때 적용됩니다."),
+                    Ui.Choices(Launcher.Setting("Aspect"), delegate(string v) { Launcher.SetSetting("Aspect", v); Window.Refresh(); },
+                        "", L.T("16:9 (기본)"),
+                        "auto", L.T("자동 (모니터 비율)"),
+                        "2.3888889", "21:9 (3440×1440)",
+                        "2.3703704", "21:9 (2560×1080)",
+                        "2.4", "21:9 (3840×1600)",
+                        "3.5555556", "32:9",
+                        "1.6", "16:10"));
+                aspect.Margin = new Thickness(0, 14, 0, 0);
+                aspect.IsEnabled = !running;
+                screen.Children.Add(aspect);
+            }
             if (build.Aa)
             {
                 FrameworkElement aa = Ui.Setting(L.T("안티에일리어싱"),
@@ -497,6 +621,7 @@ namespace GT6Launcher
                 Ui.Card(L.T("게임 빌드"),
                     Ui.Setting(L.T("플레이 버튼이 시작하는 빌드"), L.T("패키지에 든 두 실행 파일 중 하나입니다. 시험판은 자기 설정 파일을 따로 씁니다."), BuildPicker())),
                 Ui.Card(L.T("화면"), screen),
+                LanCard(build, running),
                 Ui.Card(L.T("소리와 입력"),
                     Toggle("Mute", L.T("소리 끄기"), L.T("게임의 소리를 내지 않습니다.")),
                     Toggle("Keyboard", L.T("키보드를 패드로 쓰기"), L.T("끄면 키보드가 게임 패드 노릇을 하지 않습니다 (패드나 핸들만 쓸 때)."))),

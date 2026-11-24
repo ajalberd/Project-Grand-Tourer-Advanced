@@ -23,6 +23,8 @@ namespace GT6Launcher
         static extern IntPtr CreateDesktopW(string name, IntPtr device, IntPtr devmode, int flags, uint access, IntPtr security);
         [DllImport("user32.dll")]
         static extern bool CloseDesktop(IntPtr desktop);
+        [DllImport("kernel32.dll")]
+        internal static extern uint SetErrorMode(uint mode);
 
         public readonly string Name;
         IntPtr handle;
@@ -40,19 +42,35 @@ namespace GT6Launcher
         // Runs a program on the desktop and waits for it; TimedOut / Cancelled when it had to be ended.
         public int Run(string exe, string arguments, string directory, int timeoutMs, Func<bool> cancelled)
         {
-            using (Child child = Child.Start(exe, arguments, directory, Name, false, null, null, null))
+            return RunOn(Name, exe, arguments, directory, timeoutMs, cancelled);
+        }
+
+        // Runs a program on the named desktop (null = current/normal desktop) with the same wait/cancel/job handling.
+        public static int RunOn(string desktopName, string exe, string arguments, string directory, int timeoutMs, Func<bool> cancelled)
+        {
+            // Suppress Windows "application was unable to start correctly" popups on hidden-desktop probes
+            // (inherited by child processes so a 0xC0000142 DLL-init failure falls back silently).
+            uint prevMode = SetErrorMode(0x0001u | 0x0002u);   // SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
+            try
             {
-                var watch = Stopwatch.StartNew();
-                while (!child.Wait(250))
+                using (Child child = Child.Start(exe, arguments, directory, desktopName, false, null, null, null))
                 {
-                    bool stop = cancelled != null && cancelled();
-                    if (stop || watch.ElapsedMilliseconds > timeoutMs)
+                    var watch = Stopwatch.StartNew();
+                    while (!child.Wait(250))
                     {
-                        child.Kill();
-                        return stop ? Cancelled : TimedOut;
+                        bool stop = cancelled != null && cancelled();
+                        if (stop || watch.ElapsedMilliseconds > timeoutMs)
+                        {
+                            child.Kill();
+                            return stop ? Cancelled : TimedOut;
+                        }
                     }
+                    return child.ExitCode;
                 }
-                return child.ExitCode;
+            }
+            finally
+            {
+                SetErrorMode(prevMode);
             }
         }
 
@@ -309,6 +327,7 @@ namespace GT6Launcher
         {
             try
             {
+                HiddenDesktop.SetErrorMode(0x0001u | 0x0002u);   // SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
                 Directory.CreateDirectory(launcher.LauncherLogsDir);
                 logFile = Path.Combine(launcher.LauncherLogsDir, "setup.log");
                 if (args.Length >= 3 && args[0] == "fw")
@@ -400,7 +419,7 @@ namespace GT6Launcher
                 IntPtr window = WaitWindow("RPCS3 Firmware Installer", process, 60000);
                 if (window == IntPtr.Zero)
                 {
-                    Note("firmware: no question box");
+                    Note("firmware: no question box (" + (process.HasExited ? "rpcs3 exited 0x" + process.ExitCode.ToString("X8") : "timed out") + ")");
                     return NoDialog;
                 }
                 Thread.Sleep(300);
@@ -506,16 +525,30 @@ namespace GT6Launcher
             }
         }
 
-        [DllImport("kernel32.dll")]
+        [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool AllocConsole();
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-        static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool AttachConsole(uint pid);
         [DllImport("kernel32.dll")]
+        static extern bool FreeConsole();
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool WriteConsoleInputW(IntPtr input, KeyRecord[] records, int count, out int written);
         [DllImport("kernel32.dll")]
         static extern bool CloseHandle(IntPtr handle);
 
-        [StructLayout(LayoutKind.Explicit)]
+        delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+        [DllImport("user32.dll")]
+        static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int maxCount);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int GetWindowTextW(IntPtr hwnd, StringBuilder text, int maxCount);
+
+        [StructLayout(LayoutKind.Explicit, CharSet = CharSet.Unicode)]
         struct KeyRecord   // INPUT_RECORD holding a KEY_EVENT_RECORD
         {
             [FieldOffset(0)] public ushort eventType;
@@ -527,20 +560,23 @@ namespace GT6Launcher
             [FieldOffset(16)] public uint controlKeys;
         }
 
-        // Types a line into this process's console (the one RPCS3 attaches to and reads from).
-        static void TypeIntoConsole(string line)
+        // Types a line into the currently attached console's CONIN$ buffer.
+        static bool TypeIntoConsole(string line)
         {
             IntPtr input = CreateFileW("CONIN$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
             if (input == new IntPtr(-1))
-                return;
+                return false;
             try
             {
                 var records = new List<KeyRecord>();
                 foreach (char c in line + "\r")
+                {
+                    ushort vk = (ushort)(c == '\r' ? 0x0D : (c <= 0x7F ? (int)char.ToUpperInvariant(c) : 0));
                     for (int down = 1; down >= 0; down--)
-                        records.Add(new KeyRecord { eventType = 1, keyDown = down, repeat = 1, virtualKey = (ushort)(c == '\r' ? 0x0D : 0), character = c });
+                        records.Add(new KeyRecord { eventType = 1, keyDown = down, repeat = 1, virtualKey = vk, character = c });
+                }
                 int written;
-                WriteConsoleInputW(input, records.ToArray(), records.Count, out written);
+                return WriteConsoleInputW(input, records.ToArray(), records.Count, out written) && written > 0;
             }
             finally
             {
@@ -548,16 +584,59 @@ namespace GT6Launcher
             }
         }
 
+        // Fallback when AttachConsole fails (e.g. terminal host boundary): find the console window for RPCS3 and post WM_CHAR.
+        static IntPtr FindConsoleWindow(int pid)
+        {
+            IntPtr byPid = IntPtr.Zero, byTitle = IntPtr.Zero;
+            EnumWindows(delegate(IntPtr hwnd, IntPtr lp)
+            {
+                uint wpid;
+                GetWindowThreadProcessId(hwnd, out wpid);
+                var cls = new StringBuilder(64);
+                GetClassNameW(hwnd, cls, cls.Capacity);
+                string c = cls.ToString();
+                if (wpid == (uint)pid && (c == "ConsoleWindowClass" || c == "CASCADIA_HOSTING_WINDOW_CLASS"))
+                {
+                    byPid = hwnd;
+                    return false;
+                }
+                if (c == "ConsoleWindowClass" || c == "CASCADIA_HOSTING_WINDOW_CLASS")
+                {
+                    var title = new StringBuilder(256);
+                    GetWindowTextW(hwnd, title, title.Capacity);
+                    if (title.ToString().IndexOf("rpcs3", StringComparison.OrdinalIgnoreCase) >= 0)
+                        byTitle = hwnd;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return byPid != IntPtr.Zero ? byPid : byTitle;
+        }
+
+        static bool PostKeysToConsoleWindow(int pid, string line)
+        {
+            IntPtr hwnd = FindConsoleWindow(pid);
+            if (hwnd == IntPtr.Zero)
+                return false;
+            foreach (char c in line)
+            {
+                PostMessageW(hwnd, 0x0102 /* WM_CHAR */, (IntPtr)c, IntPtr.Zero);
+                Thread.Sleep(5);
+            }
+            PostMessageW(hwnd, 0x0100 /* WM_KEYDOWN */, (IntPtr)0x0D, IntPtr.Zero);
+            PostMessageW(hwnd, 0x0102 /* WM_CHAR */, (IntPtr)0x0D, IntPtr.Zero);
+            PostMessageW(hwnd, 0x0101 /* WM_KEYUP */, (IntPtr)0x0D, (IntPtr)unchecked((int)0xC0000001));
+            return true;
+        }
+
         // rpcs3 --decrypt <file>: writes <name>.elf / <name>.prx beside the file. A file that needs a licence key is
         // asked for on a console: RPCS3 attaches to its parent's console (this agent's, on the hidden desktop) or opens
         // one of its own, and reads the key there or from standard input - it is given both ways, and nowhere else.
         static bool Decrypt(string tool, string file, string key)
         {
-            if (key != null)
-                AllocConsole();
             var info = new ProcessStartInfo(Path.Combine(tool, "rpcs3.exe"), "--decrypt \"" + file + "\"")
             {
-                WorkingDirectory = tool, UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                WorkingDirectory = tool, UseShellExecute = false, CreateNoWindow = (key == null),
+                RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
             };
             using (Process process = Process.Start(info))
             {
@@ -568,10 +647,66 @@ namespace GT6Launcher
                 if (key != null)
                 {
                     process.StandardInput.WriteLine(key);
-                    TypeIntoConsole(key);
+                    process.StandardInput.Flush();
                 }
                 process.StandardInput.Close();
-                if (!process.WaitForExit(180000))
+                if (key != null)
+                {
+                    // RPCS3 is a GUI binary that calls AllocConsole() of its own when prompting for a KLIC.
+                    // Attach directly to RPCS3's own console (AttachConsole(pid)) and type the KLIC into its CONIN$,
+                    // with a WM_CHAR fallback if AttachConsole is blocked (e.g. Windows Terminal host boundary).
+                    var watch = Stopwatch.StartNew();
+                    int consoleSent = 0, wmSent = 0;
+                    long nextTry = 400;
+                    bool loggedAttachErr = false;
+                    while (!process.WaitForExit(250) && watch.ElapsedMilliseconds < 180000)
+                    {
+                        if (watch.ElapsedMilliseconds < nextTry)
+                            continue;
+                        if (consoleSent < 2)
+                        {
+                            FreeConsole();
+                            if (AttachConsole((uint)process.Id))
+                            {
+                                Thread.Sleep(150);
+                                bool ok = TypeIntoConsole(key);
+                                FreeConsole();
+                                consoleSent++;
+                                Note("decrypt: AttachConsole TypeIntoConsole=" + ok + " (attempt " + consoleSent + ")");
+                                nextTry = watch.ElapsedMilliseconds + 2000;
+                                continue;
+                            }
+                            if (!loggedAttachErr)
+                            {
+                                Note("decrypt: AttachConsole failed (err " + Marshal.GetLastWin32Error() + ")");
+                                loggedAttachErr = true;
+                            }
+                        }
+                        if (watch.ElapsedMilliseconds >= 2000 && wmSent < 3)
+                        {
+                            if (PostKeysToConsoleWindow(process.Id, key))
+                            {
+                                wmSent++;
+                                Note("decrypt: sent key via WM_CHAR (attempt " + wmSent + ")");
+                                nextTry = watch.ElapsedMilliseconds + 2500;
+                            }
+                            else
+                            {
+                                nextTry = watch.ElapsedMilliseconds + 500;
+                            }
+                        }
+                        else
+                        {
+                            nextTry = watch.ElapsedMilliseconds + 500;
+                        }
+                    }
+                    if (!process.HasExited)
+                    {
+                        End(process);
+                        return false;
+                    }
+                }
+                else if (!process.WaitForExit(180000))
                 {
                     End(process);
                     return false;
@@ -589,6 +724,8 @@ namespace GT6Launcher
         static int Key(string tool, string loader, string self, string wantedSha256)
         {
             string key = null;
+            bool exitedEarly = false;
+            int exitCode = 0;
             Process process = Start(tool, "--no-gui \"" + loader + "\"");
             try
             {
@@ -600,6 +737,11 @@ namespace GT6Launcher
                         key = match.Groups[1].Value;
                     else
                         Thread.Sleep(100);
+                }
+                if (key == null && process.HasExited)
+                {
+                    exitedEarly = true;
+                    exitCode = process.ExitCode;
                 }
             }
             finally
@@ -616,8 +758,8 @@ namespace GT6Launcher
             }
             if (key == null)
             {
-                Note("key: the loader did not get as far as asking");
-                return Timeout;
+                Note("key: the loader did not get as far as asking (" + (exitedEarly ? "rpcs3 exited 0x" + exitCode.ToString("X8") : "timed out") + ")");
+                return exitedEarly ? NoDialog : Timeout;
             }
             bool made = Decrypt(tool, self, key);
             key = null;
@@ -817,7 +959,11 @@ namespace GT6Launcher
                 if (!DiscReady)
                     need += SetupFacts.VolumeSize;
                 if (!UpdatesReady)
-                    need += SetupFacts.UpdatesSize + 12L * 1073741824;      // the packages, and what they install
+                {
+                    CacheInfo ci = InspectCache(launcher.Value("Setup", "Cache", ""));
+                    long downloadNeed = Math.Max(0, SetupFacts.UpdatesSize - ci.FoundBytes);
+                    need += downloadNeed + 12L * 1073741824;                 // remaining packages to download, and what they install
+                }
                 if (PatchFolders.Length > 0 || !UpdatesReady)
                     need += 4L * 1073741824;                                 // the game's merge works beside its data
                 return need + 1073741824;
@@ -839,28 +985,119 @@ namespace GT6Launcher
             }
         }
 
-        // A folder that may hold the downloads already (launcher.ini [Setup] Cache, for tests): its files and those of
-        // its folders one level down.
+        public class CacheInfo
+        {
+            public bool Exists;
+            public int FoundUpdates;
+            public int TotalUpdates;
+            public long FoundBytes;
+            public long MissingBytes;
+            public bool HasFirmware;
+            public bool HasTool;
+        }
+
+        static Dictionary<string, string> ScanCacheDir(string dir)
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+                return map;
+            var dirs = new List<string> { dir };
+            try
+            {
+                foreach (string sub in Directory.GetDirectories(dir))
+                {
+                    dirs.Add(sub);
+                    try
+                    {
+                        foreach (string sub2 in Directory.GetDirectories(sub))
+                            dirs.Add(sub2);
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            foreach (string d in dirs)
+            {
+                try
+                {
+                    foreach (string file in Directory.GetFiles(d))
+                    {
+                        string name = Path.GetFileName(file);
+                        if (!map.ContainsKey(name))
+                            map[name] = file;
+                    }
+                }
+                catch (Exception)
+                {
+                }
+            }
+            return map;
+        }
+
+        public static CacheInfo InspectCache(string dir)
+        {
+            var info = new CacheInfo { TotalUpdates = SetupFacts.Updates.Length, MissingBytes = SetupFacts.UpdatesSize };
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+                return info;
+            info.Exists = true;
+            Dictionary<string, string> files = ScanCacheDir(dir);
+            foreach (UpdatePackage u in SetupFacts.Updates)
+            {
+                string path;
+                if (files.TryGetValue(u.FileName, out path))
+                {
+                    try
+                    {
+                        if (new FileInfo(path).Length == u.Size)
+                        {
+                            info.FoundUpdates++;
+                            info.FoundBytes += u.Size;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+            }
+            info.MissingBytes = Math.Max(0, SetupFacts.UpdatesSize - info.FoundBytes);
+            string pup;
+            if (files.TryGetValue("PS3UPDAT.PUP", out pup))
+            {
+                try
+                {
+                    info.HasFirmware = new FileInfo(pup).Length == SetupFacts.FirmwareSize;
+                }
+                catch (Exception)
+                {
+                }
+            }
+            string tool;
+            if (files.TryGetValue(Path.GetFileName(SetupFacts.ToolUrl), out tool))
+            {
+                try
+                {
+                    info.HasTool = new FileInfo(tool).Length == SetupFacts.ToolSize;
+                }
+                catch (Exception)
+                {
+                }
+            }
+            return info;
+        }
+
+        // A folder that may hold the downloads already (launcher.ini [Setup] Cache): its files and those of its folders
+        // up to two levels down.
         string cache;
         Dictionary<string, string> cached;
 
         string Cached(string fileName)
         {
             if (cached == null)
-            {
-                cached = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                try
-                {
-                    if (!string.IsNullOrEmpty(cache) && Directory.Exists(cache))
-                        foreach (string dir in new[] { cache }.Concat(Directory.GetDirectories(cache)))
-                            foreach (string file in Directory.GetFiles(dir))
-                                if (!cached.ContainsKey(Path.GetFileName(file)))
-                                    cached[Path.GetFileName(file)] = file;
-                }
-                catch (Exception)
-                {
-                }
-            }
+                cached = ScanCacheDir(cache);
             string path;
             return cached.TryGetValue(fileName, out path) ? path : null;
         }
@@ -1193,13 +1430,27 @@ namespace GT6Launcher
             File.WriteAllText(file, text);
         }
 
+        bool normalDesktop;
+
         int Agent(HiddenDesktop desktop, string arguments, int timeoutMs)
         {
+            if (!normalDesktop && launcher.Value("Setup", "NormalDesktop", "0") == "1")
+                normalDesktop = true;
             string exe = Process.GetCurrentProcess().MainModule.FileName;
-            int code = desktop.Run(exe, "--setup-agent " + arguments, launcher.Dir, timeoutMs, Cancelled);
+            int code = HiddenDesktop.RunOn(normalDesktop ? null : desktop.Name, exe, "--setup-agent " + arguments, launcher.Dir, timeoutMs, Cancelled);
             EndTool();
             if (code == HiddenDesktop.Cancelled)
                 throw new OperationCanceledException();
+            if (!normalDesktop && (code == SetupAgent.NoDialog || code == SetupAgent.Failed || (code < 0 && code != HiddenDesktop.TimedOut)))
+            {
+                Note("agent: hidden desktop failed (code " + code + " / 0x" + code.ToString("X8") + "); retrying on normal desktop");
+                normalDesktop = true;
+                launcher.Set("Setup", "NormalDesktop", "1");
+                code = HiddenDesktop.RunOn(null, exe, "--setup-agent " + arguments, launcher.Dir, timeoutMs, Cancelled);
+                EndTool();
+                if (code == HiddenDesktop.Cancelled)
+                    throw new OperationCanceledException();
+            }
             return code;
         }
 
@@ -1521,6 +1772,12 @@ namespace GT6Launcher
             environment.Remove("PS3_USRDIR_OVERLAY");   // no mod may stand in while the game merges its own files
             environment.Remove("PS3_FSLOG");            // set at all (the bat's "0" too) = a line for every file operation
             environment.Remove("PS3_VERBOSE");
+            environment.Remove("GT6_LAN");              // keep first-time patch merge out of lanmode even if copied from another PC
+            environment.Remove("GT6_LAN_BIND");
+            environment.Remove("GT6_LAN_NAME");
+            environment.Remove("GT6_DEV_MENU");
+            environment.Remove("PS3_NET_ONLINE");
+            environment.Remove("PS3_ARGV");
             environment["PS3_MUTE"] = "1";
             environment["PAD_NO_KEYBOARD"] = "1";        // what the user types meanwhile goes elsewhere
             environment["PS3_OSK_TEXT"] = "Player";      // and no text box can open

@@ -1,0 +1,101 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 9ab2953b..a48d8ba2 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -64,6 +64,7 @@ unsigned long long rsx_live_draw_fence_wait_us(unsigned* w) { if (w) *w = 0; ret
+ void rsx_live_draw_set_present_nowait(int on) { (void)on; }
+ int rsx_live_draw_present_stretch = 0;
+ float rsx_live_draw_present_gamma = 1.0f;
++float rsx_live_draw_present_aspect = 0.0f;
+ void rsx_live_draw_upscale(float ux, float uy) { (void)ux; (void)uy; }
+ void rsx_live_draw_upscale_size(u32 w, u32 h) { (void)w; (void)h; }
+ double rsx_live_draw_get_present_fps(void) { return 0.0; }
+@@ -890,6 +891,8 @@ int rsx_live_draw_present_stretch = 0;
+  * gamma, cellAvconfExt_display_gamma: PS3_DISPLAY_GAMMA or cellVideoOutSetGamma). 1 = the bytes as the title drew them,
+  * copied as before; under 1 brightens the middle tones, black and white stay where they are. */
+ float rsx_live_draw_present_gamma = 1.0f;
++/* Custom display aspect ratio (0 = stock g.width / g.height = 16:9; >0 = e.g. 2.3889 for 3440x1440 ultrawide). */
++float rsx_live_draw_present_aspect = 0.0f;
+ /* Host-side resolution [GT6 0102]: colour surfaces whose guest size is one the host listed (the title's full-screen
+  * targets: GT6's 1080p scene and display buffers) are made g_up_x x g_up_y as large on the host - a higher real
+  * resolution, not a stretch. Everything else (shadow maps, atlases, the brightness samples, the reflection faces)
+@@ -17900,7 +17903,10 @@ void rsx_live_draw_present(u32 buffer_id)
+     { LONG lcw = 0, lch = 0;
+       if (ld_client_size(&lcw, &lch) && fit_src_w && fit_src_h && g.width && g.height && bb_w && bb_h) {
+           const double cw = (double)lcw, chh = (double)lch;
+-          const double ca = cw / (chh > 0.0 ? chh : 1.0), pa = (double)g.width / (double)g.height;
++          const double ca = cw / (chh > 0.0 ? chh : 1.0);
++          const double pa = (rsx_live_draw_present_aspect > 0.5f)
++              ? (double)rsx_live_draw_present_aspect
++              : ((double)g.width / (double)g.height);
+           if (cw >= 16.0 && chh >= 16.0 && fabs(ca / pa - 1.0) > 0.005) {
+               double pw = cw, ph = chh;                       /* the picture in the client area */
+               if (ca > pa) pw = chh * pa; else ph = cw / pa;
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index 5c25f2f3..b5054aac 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -208,27 +208,32 @@ static void frame_extra(HWND hwnd, DWORD style, DWORD exstyle, LONG* fw, LONG* f
+     *fh = nc.bottom - nc.top;
+ }
+ 
++/* Custom window aspect ratio (0 = stock s_state.width / s_state.height; >0 = ultrawide e.g. 3440/1440). */
++float rsx_window_aspect = 0.0f;
++
+ /* While the window is dragged by its frame: the client area keeps the picture's shape. */
+ static void keep_shape(HWND hwnd, UINT edge, RECT* r)
+ {
+-    const long long pw = (long long)s_state.width, ph = (long long)s_state.height;
+-    if (pw <= 0 || ph <= 0)
++    const double aspect = (rsx_window_aspect > 0.5f)
++        ? (double)rsx_window_aspect
++        : (s_state.width && s_state.height ? (double)s_state.width / (double)s_state.height : 0.0);
++    if (aspect <= 0.0)
+         return;
+     LONG fw, fh;                                                       /* the frame and the caption */
+     frame_extra(hwnd, (DWORD)GetWindowLongA(hwnd, GWL_STYLE), (DWORD)GetWindowLongA(hwnd, GWL_EXSTYLE), &fw, &fh);
+     const long long cw = (r->right - r->left) - fw, ch = (r->bottom - r->top) - fh;
+     switch (edge) {
+     case WMSZ_LEFT: case WMSZ_RIGHT:
+-        r->bottom = r->top + (LONG)(cw * ph / pw) + fh;
++        r->bottom = r->top + (LONG)((double)cw / aspect + 0.5) + fh;
+         break;
+     case WMSZ_TOP: case WMSZ_BOTTOM:
+-        r->right = r->left + (LONG)(ch * pw / ph) + fw;
++        r->right = r->left + (LONG)((double)ch * aspect + 0.5) + fw;
+         break;
+     case WMSZ_TOPLEFT: case WMSZ_TOPRIGHT:
+-        r->top = r->bottom - ((LONG)(cw * ph / pw) + fh);
++        r->top = r->bottom - ((LONG)((double)cw / aspect + 0.5) + fh);
+         break;
+     default:   /* the bottom corners */
+-        r->bottom = r->top + (LONG)(cw * ph / pw) + fh;
++        r->bottom = r->top + (LONG)((double)cw / aspect + 0.5) + fh;
+         break;
+     }
+ }
+@@ -476,17 +481,19 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+      * fit the primary monitor's work area, the biggest client area of the picture's shape that does, centred there. */
+     LONG fw = 0, fh = 0;
+     frame_extra(NULL, WS_OVERLAPPEDWINDOW, 0, &fw, &fh);
+-    LONG cw = (LONG)width, ch = (LONG)height;
++    LONG cw = (rsx_window_aspect > 0.5f && height) ? (LONG)((double)height * (double)rsx_window_aspect + 0.5) : (LONG)width;
++    LONG ch = (LONG)height;
++    const LONG pic_w = cw, pic_h = ch;
+     int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT;
+     { RECT work;
+-      if (width && height && SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
++      if (pic_w && pic_h && SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
+           const LONG aw = (work.right - work.left) - fw, ah = (work.bottom - work.top) - fh;
+           if (aw > 64 && ah > 64 && (cw > aw || ch > ah)) {
+-              if ((long long)aw * height <= (long long)ah * width) { cw = aw; ch = (LONG)((long long)aw * height / width); }
+-              else { ch = ah; cw = (LONG)((long long)ah * width / height); }
++              if ((long long)aw * pic_h <= (long long)ah * pic_w) { cw = aw; ch = (LONG)((long long)aw * pic_h / pic_w); }
++              else { ch = ah; cw = (LONG)((long long)ah * pic_w / pic_h); }
+               wx = work.left + ((work.right - work.left) - (cw + fw)) / 2;
+               wy = work.top + ((work.bottom - work.top) - (ch + fh)) / 2;
+-              fprintf(stderr, "[window] %ux%u does not fit the work area %ldx%ld: client area %ldx%ld\n", width, height,
++              fprintf(stderr, "[window] %ldx%ld does not fit the work area %ldx%ld: client area %ldx%ld\n", (long)pic_w, (long)pic_h,
+                       (long)(work.right - work.left), (long)(work.bottom - work.top), (long)cw, (long)ch);
+           }
+       } }

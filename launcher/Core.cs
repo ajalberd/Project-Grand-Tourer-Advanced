@@ -259,12 +259,17 @@ namespace GT6Launcher
             { "Keyboard", "1" },        // off: PAD_NO_KEYBOARD=1 (the keyboard no longer acts as a pad)
             { "AutoBackup", "1" },      // save data backup before each run
             { "BackupsToKeep", "10" },
-            { "UpdateCheck", "1" },     // the launcher looks for a new release once a day (needs a repository address)
-            { "AutoUpdate", "1" },      // ...downloads it without asking and applies it at the next start
+            { "UpdateCheck", "0" },     // off by default for custom Ultrawide/LAN builds (re-enable manually in Updates if desired)
+            { "AutoUpdate", "0" },      // ...never silently overwrite custom GT6Recomp.exe / GT6 Launcher.exe
             { "Language", "" },         // "" = by Windows' display language, "ko", "en" (Lang.cs)
             { "UseGhCli", "0" },        // a private repository: the GitHub CLI's login of this PC when no token was pasted
             { "AA", "" },               // anti-aliasing of a run: "" = the game's own default (GPU filter), "off", "spu" (GT6_AA)
             { "Fullscreen", "0" },      // start in borderless full screen (GT6_FULLSCREEN=1)
+            { "Aspect", "" },           // aspect ratio override: "" = 16:9, "auto", "2.3888889", "2.3703704", "2.4", "3.5555556", "1.6" (GT6_ASPECT)
+            { "LanMode", "0" },         // hidden LAN mode (GT6_LAN=1 -> lanmode argv, room sync + member info patches, Winsock2)
+            { "LanBind", "" },          // LAN NIC IPv4 bind address (GT6_LAN_BIND -> PS3_NET_BIND_IP)
+            { "LanName", "" },          // LAN player name / PS3_NP_ONLINE_ID (GT6_LAN_NAME; blank = PC name)
+            { "DevMenu", "0" },         // Develop Settings R1+SELECT (GT6_DEV_MENU=1; auto-enabled with LanMode)
         };
 
         public static string Default(string key)
@@ -287,6 +292,21 @@ namespace GT6Launcher
                 env["GT6_AA"] = aa;                                  // "" = the game's own default, the GPU filter
             if (launcher.On("Fullscreen"))
                 env["GT6_FULLSCREEN"] = "1";                         // an exe that does not know it ignores it
+            string aspect = launcher.Setting("Aspect");
+            if (!string.IsNullOrEmpty(aspect))
+                env["GT6_ASPECT"] = aspect;
+            if (launcher.On("LanMode"))
+            {
+                env["GT6_LAN"] = "1";
+                string bindIp = launcher.Setting("LanBind").Trim();
+                if (!string.IsNullOrEmpty(bindIp))
+                    env["GT6_LAN_BIND"] = bindIp;
+                string lanName = launcher.Setting("LanName").Trim();
+                if (!string.IsNullOrEmpty(lanName))
+                    env["GT6_LAN_NAME"] = lanName;
+            }
+            if (launcher.On("DevMenu"))
+                env["GT6_DEV_MENU"] = "1";
             return env;
         }
     }
@@ -299,7 +319,7 @@ namespace GT6Launcher
         public readonly Dictionary<string, string> Env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         public readonly List<string> Unset = new List<string>();
         public readonly List<KeyValuePair<string, string>> Copies = new List<KeyValuePair<string, string>>();   // the bat's log rotation
-        public bool FullHd, Overlay, Aa, FullScreen, RealRes;   // what this exe knows (looked for in the exe itself)
+        public bool FullHd, Overlay, Aa, FullScreen, RealRes, Ultrawide, Lan;   // what this exe knows (looked for in the exe itself)
 
         public bool Available { get { return Problem == null && Exe != null && File.Exists(Exe); } }
         public string ExeName { get { return Exe == null ? "" : Path.GetFileName(Exe); } }
@@ -380,12 +400,12 @@ namespace GT6Launcher
             try
             {
                 var file = new FileInfo(b.Exe);
-                string stamp = "3:" + file.Length + ":" + file.LastWriteTimeUtc.Ticks;   // (3: the list of names grew; an older record is looked up again)
+                string stamp = "5:" + file.Length + ":" + file.LastWriteTimeUtc.Ticks;   // (5: added GT6_LAN)
                 string[] known = launcher.Value("Exe", b.ExeName, "").Split('|');
                 if (known.Length != 2 || known[0] != stamp)
                 {
-                    bool[] found = Scan(b.Exe, "MenuFullHd", "PS3_USRDIR_OVERLAY", "GT6_AA", "GT6_FULLSCREEN", "ScreenRealRes");
-                    known = new[] { stamp, (found[0] ? "F" : "") + (found[1] ? "O" : "") + (found[2] ? "A" : "") + (found[3] ? "S" : "") + (found[4] ? "R" : "") };
+                    bool[] found = Scan(b.Exe, "MenuFullHd", "PS3_USRDIR_OVERLAY", "GT6_AA", "GT6_FULLSCREEN", "ScreenRealRes", "GT6_ASPECT", "GT6_LAN");
+                    known = new[] { stamp, (found[0] ? "F" : "") + (found[1] ? "O" : "") + (found[2] ? "A" : "") + (found[3] ? "S" : "") + (found[4] ? "R" : "") + (found[5] ? "W" : "") + (found[6] ? "L" : "") };
                     launcher.Set("Exe", b.ExeName, known[0] + "|" + known[1]);
                 }
                 b.FullHd = known[1].Contains("F");
@@ -393,6 +413,8 @@ namespace GT6Launcher
                 b.Aa = known[1].Contains("A");
                 b.FullScreen = known[1].Contains("S");
                 b.RealRes = known[1].Contains("R");   // [GT6 0102] the F2 menu's real resolution ("ScreenRealRes")
+                b.Ultrawide = known[1].Contains("W"); // GT6_ASPECT ultrawide support
+                b.Lan = known[1].Contains("L");       // GT6_LAN LAN mode + patches
             }
             catch (Exception)
             {

@@ -164,6 +164,11 @@ extern "C" void cellVideoOut_set_resolution(unsigned char resolutionId);        
 static int g_gt6_res_1080 = 0;
 extern "C" int gt6_menu_setting_full_hd(void);      /* gt6_menu_engine.cpp */
 extern "C" int rsx_live_draw_present_stretch;       /* rsx_live_draw.c: the scanout is stretched over the window */
+extern "C" float rsx_live_draw_present_aspect;      /* rsx_live_draw.c: custom display aspect ratio (0 = 16:9) */
+extern "C" float rsx_window_aspect;                 /* rsx_null_backend.c: custom window aspect ratio (0 = 16:9) */
+extern "C" float g_gt6_aspect;                      /* gt6_host.cpp: 3D projection aspect override at 0x008A615C */
+extern "C" int   g_gt6_lan;                         /* gt6_host.cpp: LAN mode patches (0x00A0BDAC/BF50, 0x00B69768) */
+extern "C" int   g_gt6_dev_menu;                    /* gt6_host.cpp: Develop Settings (0x0081715C) */
 extern "C" void rsx_live_draw_upscale(float ux, float uy);       /* rsx_live_draw.c [GT6 0102] */
 extern "C" void rsx_live_draw_upscale_size(unsigned w, unsigned h);
 extern "C" int gt6_res_1080(void) { return g_gt6_res_1080; }   /* (the menu shows which mode this run is in) */
@@ -920,6 +925,51 @@ int main(int argc, char** argv)
     /* Defaults a plain start needs (the environment still overrides each):
      * argv[0] as the loader EBOOT hands it to EMAIN, and the live renderer. */
     if (!getenv("PS3_BOOT_PATH")) _putenv_s("PS3_BOOT_PATH", "/dev_hdd0/game/BCES01893/USRDIR/EMAIN.SELF");
+
+    /* GT6_DEV_MENU=1: Develop Settings (R1+SELECT at My Home -> Tutorial -> Complete All).
+     * GT6_LAN=1: hidden LAN mode ("lanmode" argv, room-sync + member-info patches, Winsock2 sockets, no PSN). */
+    { const char* dm = getenv("GT6_DEV_MENU");
+      if (dm && *dm == '1') {
+          g_gt6_dev_menu = 1;
+          fprintf(stderr, "[gt6] Develop Settings enabled (GT6_DEV_MENU=1)\n");
+      }
+      const char* lan = getenv("GT6_LAN");
+      if (lan && *lan == '1') {
+          g_gt6_lan = 1;
+          g_gt6_dev_menu = 1;
+          _putenv_s("PS3_NET_ONLINE", "1");
+          const char* cur_argv = getenv("PS3_ARGV");
+          if (!cur_argv || !*cur_argv) {
+              _putenv_s("PS3_ARGV", "lanmode");
+          } else if (!strstr(cur_argv, "lanmode")) {
+              char buf[512];
+              snprintf(buf, sizeof(buf), "%s;lanmode", cur_argv);
+              _putenv_s("PS3_ARGV", buf);
+          }
+          const char* bind_ip = getenv("GT6_LAN_BIND");
+          if (bind_ip && *bind_ip && !getenv("PS3_NET_BIND_IP"))
+              _putenv_s("PS3_NET_BIND_IP", bind_ip);
+          const char* lan_name = getenv("GT6_LAN_NAME");
+          if (lan_name && *lan_name && !getenv("PS3_NP_ONLINE_ID"))
+              _putenv_s("PS3_NP_ONLINE_ID", lan_name);
+          if (!getenv("PS3_NP_ONLINE_ID") || !*getenv("PS3_NP_ONLINE_ID")) {
+              const char* host = getenv("COMPUTERNAME");
+              if (host && *host) {
+                  char clean[17]; size_t n = 0;
+                  for (const char* p = host; *p && n < 16; p++) {
+                      unsigned char c = (unsigned char)*p;
+                      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')
+                          clean[n++] = (char)c;
+                  }
+                  clean[n] = '\0';
+                  if (n > 0) _putenv_s("PS3_NP_ONLINE_ID", clean);
+              }
+          }
+          fprintf(stderr, "[gt6-lan] LAN mode enabled (argv=%s, bind=%s, user=%s)\n",
+                  getenv("PS3_ARGV") ? getenv("PS3_ARGV") : "",
+                  getenv("PS3_NET_BIND_IP") ? getenv("PS3_NET_BIND_IP") : "auto",
+                  getenv("PS3_NP_ONLINE_ID") ? getenv("PS3_NP_ONLINE_ID") : "default");
+      } }
     if (!getenv("RSX_LIVE_DRAW")) _putenv_s("RSX_LIVE_DRAW", "1");
     /* Retain unchanged vertex arrays on the GPU. LD_VTX_SLAB=0 keeps the
      * ordinary upload path available for diagnosis and comparison. */
@@ -1035,6 +1085,36 @@ int main(int argc, char** argv)
                   if (*h) cellfs_add_path_mapping(d[1], h);
       } }
 
+    /* GT6_ASPECT: ultrawide / custom display aspect ratio ("auto", "W:H", "WxH", or float e.g. "2.3888889").
+     * Widens 3D projection at 0x008A615C, updates D3D12 present & window shape, and widens real-res width. */
+    { const char* ae = getenv("GT6_ASPECT");
+      if (ae && *ae && strcmp(ae, "0") != 0 && _stricmp(ae, "16:9") != 0 && _stricmp(ae, "off") != 0) {
+          float asp = 0.0f;
+          if (_stricmp(ae, "auto") == 0) {
+              DEVMODEA dm; memset(&dm, 0, sizeof(dm)); dm.dmSize = sizeof(dm);
+              if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0) {
+                  const float ma = (float)dm.dmPelsWidth / (float)dm.dmPelsHeight;
+                  if (fabsf(ma / (16.0f / 9.0f) - 1.0f) > 0.01f)
+                      asp = ma;
+                  fprintf(stderr, "[gt6] GT6_ASPECT=auto: monitor %lux%lu (%.4f)%s\n",
+                          (unsigned long)dm.dmPelsWidth, (unsigned long)dm.dmPelsHeight, (double)ma,
+                          asp > 0.5f ? " -> ultrawide/custom active" : " -> stock 16:9");
+              }
+          } else {
+              float a = 0.0f, b = 0.0f;
+              if (sscanf(ae, "%f:%f", &a, &b) == 2 && a > 0.0f && b > 0.0f) asp = a / b;
+              else if (sscanf(ae, "%fx%f", &a, &b) == 2 && a > 0.0f && b > 0.0f) asp = a / b;
+              else asp = (float)atof(ae);
+          }
+          if (asp >= 1.0f && asp <= 6.0f) {
+              g_gt6_aspect = asp;
+              rsx_live_draw_present_aspect = asp;
+              rsx_window_aspect = asp;
+              rsx_live_draw_present_stretch = 1;
+              fprintf(stderr, "[gt6] aspect ratio override: %.4f (GT6_ASPECT=%s)\n", (double)asp, ae);
+          }
+      } }
+
     { const char* e = getenv("GT6_RES");
       const int by_env = e && *e;
       if (by_env ? atoi(e) == 1080 : gt6_menu_setting_full_hd() != 0) {
@@ -1055,7 +1135,17 @@ int main(int argc, char** argv)
             } else {
                 static const unsigned sizes[4][2] = { {0, 0}, {1920, 1080}, {2560, 1440}, {3840, 2160} };
                 const int r = gt6_menu_setting_real_res();
-                if (r > 0 && r < 4) { uw = sizes[r][0]; uh = sizes[r][1]; }
+                if (r > 0 && r < 4) {
+                    uw = sizes[r][0];
+                    uh = sizes[r][1];
+                    if (g_gt6_aspect > 0.5f) {
+                        unsigned aw = (unsigned)((double)uh * (double)g_gt6_aspect + 0.5);
+                        aw = (aw + 1u) & ~1u;
+                        if (aw < 1440u) aw = 1440u;
+                        if (aw > 7680u) aw = 7680u;
+                        uw = aw;
+                    }
+                }
             }
             const char* nm = getenv("GT6_NO_MLAA");
             if (uw && nm && *nm == '0') {

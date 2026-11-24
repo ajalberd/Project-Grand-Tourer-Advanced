@@ -42,6 +42,10 @@ extern int (*rsx_live_draw_overlay_on)(void);
 extern void (*rsx_live_draw_overlay_draw)(void* dev, void* queue, void* list, void* backbuffer, size_t rtv, unsigned width,
                                           unsigned height);
 extern int (*cellPad_overlay_hook)(unsigned port, unsigned buttons);
+extern float g_gt6_aspect;
+extern float rsx_live_draw_present_aspect;
+extern float rsx_window_aspect;
+extern int rsx_live_draw_present_stretch;
 int gt6_res_1080(void);     /* main.cpp: 1 = this run is in the game's 1080p mode */
 int gt6_real_res(void);     /* main.cpp [GT6 0102]: this run's real resolution (Settings::realRes, 0 = off) */
 }
@@ -826,6 +830,29 @@ void pageSettings(Settings& s)
                                    "밝아집니다(검정과 흰색은 그대로). 바로 적용됩니다."),
                       nullptr, &s.screenBright, 0.6, 1.6, 0.5, 2.0, "%.2f", true))
             U.dirty = true;
+        // Live 3D aspect ratio override (0x008A615C + D3D12 present/window shape)
+        {
+            rowLabel(gt6_tr_english() ? "Aspect ratio (live)" : "화면 비율 (바로 적용)",
+                     gt6_tr_english() ? "Widens the 3D view and removes pillarbox bars on ultrawide monitors. Menus/HUD stretch horizontally. Set in the launcher too so real resolution matches (e.g. 3440x1440)."
+                                      : "울트라와이드 모니터에서 3D 시야를 넓히고 좌우 검은 여백을 없앱니다. 메뉴/HUD는 가로로 늘어납니다. 런처에서도 설정하면 실제 해상도 폭도 맞춥니다 (예: 3440x1440).");
+            static const float kAspects[4] = { 0.0f, 3440.0f / 1440.0f, 2560.0f / 1080.0f, 32.0f / 9.0f };
+            static const char* kAspectNames[4] = { "16:9", "21:9 (3440)", "21:9 (2560)", "32:9" };
+            int cur = 0;
+            for (int i = 1; i < 4; i++)
+                if (g_gt6_aspect > 0.5f && std::fabs(g_gt6_aspect - kAspects[i]) < 0.02f) cur = i;
+            const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 3) / 4.0f;
+            for (int i = 0; i < 4; i++) {
+                if (i) ImGui::SameLine();
+                ImGui::PushID(960 + i);
+                if (button(kAspectNames[i], cur == i ? 1 : 2, std::floor(w))) {
+                    g_gt6_aspect = kAspects[i];
+                    rsx_live_draw_present_aspect = kAspects[i];
+                    rsx_window_aspect = kAspects[i];
+                    if (kAspects[i] > 0.5f) rsx_live_draw_present_stretch = 1;
+                }
+                ImGui::PopID();
+            }
+        }
         endRows();
     }
     if (s.fullHd != (gt6_res_1080() != 0))

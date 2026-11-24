@@ -146,6 +146,8 @@ namespace GT6Launcher
             facts.Children.Add(Line(L.T("걸리는 시간"), L.T("받기는 인터넷 속도에 따라 다릅니다 (100 Mbps에서 약 20분). 설치는 약 15분입니다.")));
             facts.Children.Add(Line(L.T("지원"), L.T("Windows 10 / 11 PC (64비트). Steam Deck, 맥, 리눅스, 안드로이드, iOS는 지원하지 않습니다.")));
             stack.Children.Add(facts);
+            if (!r.UpdatesReady || !r.ModuleReady)
+                stack.Children.Add(CacheSection());
             if (failure != null)
             {
                 var failed = Ui.Text(failure + "\n" + L.T("다시 시작하면 멈춘 곳부터 이어서 진행합니다."), "Body");
@@ -168,6 +170,83 @@ namespace GT6Launcher
                 stack.Children.Add(hint);
             }
             return Ui.Card(L.T("2. 설치"), stack);
+        }
+
+        UIElement CacheSection()
+        {
+            var box = new StackPanel { Margin = new Thickness(0, 14, 0, 4) };
+            var title = Ui.Text(L.T("이미 받아 둔 업데이트 폴더 (선택)"), "H2");
+            title.Margin = new Thickness(0, 0, 0, 4);
+            box.Children.Add(title);
+            string cachePath = Launcher.Value("Setup", "Cache", "");
+            if (string.IsNullOrEmpty(cachePath))
+            {
+                var desc = Ui.Text(L.T("BCES01893 업데이트 .pkg 파일이나 PS3UPDAT.PUP이 이미 있는 폴더를 고르면 다시 받지 않고 바로 씁니다. 원본 파일은 지워지지 않습니다."), "Caption");
+                desc.Margin = new Thickness(0, 0, 0, 8);
+                box.Children.Add(desc);
+            }
+            else
+            {
+                SetupRunner.CacheInfo info = SetupRunner.InspectCache(cachePath);
+                string status;
+                Brush brush;
+                if (!info.Exists)
+                {
+                    status = "✕ " + cachePath + "\n" + L.T("폴더를 찾지 못했습니다.");
+                    brush = Ui.Brush("Warn");
+                }
+                else if (info.FoundUpdates == 0 && !info.HasFirmware && !info.HasTool)
+                {
+                    status = "! " + cachePath + "\n" + L.T("이 폴더(하위 2단계 포함)에서 일치하는 BCES01893 업데이트 .pkg나 PS3UPDAT.PUP을 찾지 못했습니다.");
+                    brush = Ui.Brush("Warn");
+                }
+                else
+                {
+                    var parts = new List<string>();
+                    if (info.FoundUpdates > 0)
+                        parts.Add(info.FoundUpdates + " / " + info.TotalUpdates + L.T("개 업데이트 (") + Gb(info.FoundBytes) + ")");
+                    if (info.HasFirmware)
+                        parts.Add(L.T("PS3 시스템 소프트웨어"));
+                    if (info.HasTool)
+                        parts.Add("RPCS3");
+                    string summary = string.Join(", ", parts.ToArray());
+                    if (info.MissingBytes > 0)
+                        summary += "  ·  " + L.T("추가로 받을 용량 ") + Gb(info.MissingBytes);
+                    else if (info.FoundUpdates == info.TotalUpdates)
+                        summary += "  ·  " + L.T("모든 업데이트 준비됨");
+                    status = "✓ " + cachePath + "\n" + summary;
+                    brush = Ui.Brush("Good");
+                }
+                var line = Ui.Text(status, "Body");
+                line.Foreground = brush;
+                line.Margin = new Thickness(0, 2, 0, 8);
+                box.Children.Add(line);
+            }
+            var buttons = new WrapPanel();
+            var margin = new Thickness(0, 0, 8, 4);
+            Button pick = Ui.Button(L.T("업데이트 폴더 고르기…"), delegate
+            {
+                string picked = Ui.FolderDialog(L.T("이미 받아 둔 업데이트 .pkg 파일이나 PS3UPDAT.PUP이 들어 있는 폴더를 고르세요."), string.IsNullOrEmpty(cachePath) ? null : cachePath);
+                if (!string.IsNullOrEmpty(picked))
+                {
+                    Launcher.Set("Setup", "Cache", picked);
+                    Window.Refresh();
+                }
+            }, null, "", margin);
+            pick.IsEnabled = !searching;
+            buttons.Children.Add(pick);
+            if (!string.IsNullOrEmpty(cachePath))
+            {
+                Button clear = Ui.Button(L.T("비우기"), delegate
+                {
+                    Launcher.Set("Setup", "Cache", "");
+                    Window.Refresh();
+                }, null, "", margin);
+                clear.IsEnabled = !searching;
+                buttons.Children.Add(clear);
+            }
+            box.Children.Add(buttons);
+            return box;
         }
 
         Border ProgressCard()

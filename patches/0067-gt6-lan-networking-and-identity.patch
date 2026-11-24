@@ -1,0 +1,133 @@
+diff --git a/libs/network/cellNetCtl.c b/libs/network/cellNetCtl.c
+index 8b002ffe..c6263202 100644
+--- a/libs/network/cellNetCtl.c
++++ b/libs/network/cellNetCtl.c
+@@ -63,6 +63,17 @@ static NetCtlHandlerSlot s_handlers[CELL_NET_CTL_HANDLER_MAX];
+ /* Try to get the host machine's IP address */
+ static int netctl_get_host_ip(char* buf, size_t buflen)
+ {
++    /* Respect PS3_NET_BIND_IP (e.g. from GT6_LAN_BIND) so multi-NIC PCs report the chosen LAN adapter. */
++    {
++        const char* bind_ip = getenv("PS3_NET_BIND_IP");
++        if (bind_ip && *bind_ip && strcmp(bind_ip, "0.0.0.0") != 0) {
++            unsigned a = 0, b = 0, c = 0, d = 0;
++            if (sscanf(bind_ip, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 && a < 256 && b < 256 && c < 256 && d < 256) {
++                snprintf(buf, buflen, "%u.%u.%u.%u", a, b, c, d);
++                return 1;
++            }
++        }
++    }
+ #ifdef _WIN32
+     WSADATA wsa;
+     char hostname[256];
+@@ -233,8 +244,14 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
+         break;
+ 
+     case CELL_NET_CTL_INFO_DEFAULT_ROUTE:
+-        strncpy(info->default_route, "192.168.1.1",
+-                sizeof(info->default_route) - 1);
++        {
++            char ip[32];
++            unsigned a = 192, b = 168, c = 1, d = 1;
++            if (netctl_get_host_ip(ip, sizeof(ip)) && sscanf(ip, "%u.%u.%u.%u", &a, &b, &c, &d) == 4)
++                snprintf(info->default_route, sizeof(info->default_route), "%u.%u.%u.1", a, b, c);
++            else
++                strncpy(info->default_route, "192.168.1.1", sizeof(info->default_route) - 1);
++        }
+         break;
+ 
+     case CELL_NET_CTL_INFO_PRIMARY_DNS:
+diff --git a/libs/network/sysNet.c b/libs/network/sysNet.c
+index 87595f37..44e752fd 100644
+--- a/libs/network/sysNet.c
++++ b/libs/network/sysNet.c
+@@ -414,6 +414,14 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
+ #endif
+         }
+     }
++    if (!s_sockets[s].p2p && a.sin_addr.s_addr == htonl(INADDR_ANY)) {
++        const char* bind_ip = getenv("PS3_NET_BIND_IP");
++        if (bind_ip && *bind_ip && strcmp(bind_ip, "0.0.0.0") != 0) {
++            struct in_addr ba;
++            if (inet_pton(AF_INET, bind_ip, &ba) == 1)
++                a.sin_addr = ba;
++        }
++    }
+     if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR) {
+         /* Last resort for a P2P stream socket that still can't share the
+          * port: an ephemeral one. It connects, but titles that check the
+@@ -983,6 +991,18 @@ uint32_t sys_net_bnet_inet_ntoa(uint32_t addr)
+     return ea;
+ }
+ 
++uint32_t sys_net_bnet_inet_ntop(int32_t af, const void* src, char* dst, uint32_t size)
++{
++    if (af != SYS_NET_AF_INET || !src || !dst || size < 16) {
++        fail(af != SYS_NET_AF_INET ? SYS_NET_EAFNOSUPPORT : 28 /* SYS_NET_ENOSPC */);
++        return 0;
++    }
++    const uint8_t* b = GUEST_PTR(EA(src), const uint8_t*);
++    char* out = GUEST_PTR(EA(dst), char*);
++    snprintf(out, size, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
++    return EA(dst);
++}
++
+ uint32_t sys_net_bnet_gethostbyname(const char* name)
+ {
+     const char* host = GUEST_PTR(EA(name), const char*);
+@@ -1052,6 +1072,7 @@ static void h_inet_pton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_pton(S32(3
+ static void h_inet_aton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_aton(PTR(3), PTR(4))); }
+ static void h_inet_addr(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_addr(PTR(3))); }
+ static void h_inet_ntoa(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntoa(R32(3))); }
++static void h_inet_ntop(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntop(S32(3), PTR(4), PTR(5), R32(6))); }
+ static void h_gethostbyname(ppu_context* ctx) { RET_U(sys_net_bnet_gethostbyname(PTR(3))); }
+ static void h_errno_loc(ppu_context* ctx)   { RET_U(sys_net_errno_loc()); }
+ static void h_h_errno_loc(ppu_context* ctx) { RET_U(scratch(&s_h_errno_ea, 4)); }
+@@ -1072,7 +1093,7 @@ void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int size, unsign
+         { "getpeername", h_getpeername }, { "socketpoll", h_poll },
+         { "socketselect", h_select },     { "inet_aton", h_inet_aton },
+         { "inet_addr", h_inet_addr },     { "inet_ntoa", h_inet_ntoa },
+-        { "inet_pton", h_inet_pton },
++        { "inet_pton", h_inet_pton },     { "inet_ntop", h_inet_ntop },
+         { "gethostbyname", h_gethostbyname },
+         { "_sys_net_errno_loc", h_errno_loc },
+         { "_sys_net_h_errno_loc", h_h_errno_loc },
+diff --git a/libs/system/cellSysutil.c b/libs/system/cellSysutil.c
+index ecd369a4..c2d4f132 100644
+--- a/libs/system/cellSysutil.c
++++ b/libs/system/cellSysutil.c
+@@ -466,7 +466,8 @@ s32 cellSysutilGetSystemParamString(s32 id, u32 buf_ea, u32 bufsize)
+ 
+     switch (id) {
+     case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME: {
+-        const char* s = "ps3recomp_user";
++        const char* env_id = getenv("PS3_NP_ONLINE_ID");
++        const char* s = (env_id && *env_id) ? env_id : "ps3recomp_user";
+         u32 i;
+         for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(buf_ea + i, (uint8_t)s[i]);
+         vm_write8(buf_ea + i, 0);
+diff --git a/libs/system/cellUserInfo.c b/libs/system/cellUserInfo.c
+index c5ac35e6..611c0e77 100644
+--- a/libs/system/cellUserInfo.c
++++ b/libs/system/cellUserInfo.c
+@@ -6,6 +6,7 @@
+ 
+ #include "cellUserInfo.h"
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <stdint.h>
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+@@ -45,7 +46,11 @@ s32 cellUserInfoGetStat(u32 id, CellUserInfoUserStat* stat)
+      * overflows the guest's stack buffer (see header comment). */
+     memset(stat, 0, sizeof(CellUserInfoUserStat));
+     stat->id = BE32(EMU_USER_ID);
+-    strncpy(stat->name, EMU_USER_NAME, CELL_USERINFO_USERNAME_SIZE - 1);
++    {
++        const char* env_id = getenv("PS3_NP_ONLINE_ID");
++        const char* uname = (env_id && *env_id) ? env_id : EMU_USER_NAME;
++        strncpy(stat->name, uname, CELL_USERINFO_USERNAME_SIZE - 1);
++    }
+ 
+     return CELL_OK;
+ }

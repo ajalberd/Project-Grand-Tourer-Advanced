@@ -20,9 +20,9 @@
     <GradientStop Color="#FF6A3D" Offset="0.55"/>
     <GradientStop Color="#FF9A3D" Offset="1"/>
   </LinearGradientBrush>
-  <FontFamily x:Key="UiFont">Malgun Gothic</FontFamily>
+  <FontFamily x:Key="UiFont">Segoe UI, Malgun Gothic</FontFamily>
   <FontFamily x:Key="IconFont">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
-  <FontFamily x:Key="TitleFont">Yu Gothic UI, Meiryo UI, Malgun Gothic</FontFamily>
+  <FontFamily x:Key="TitleFont">Segoe UI, Yu Gothic UI, Meiryo UI, Malgun Gothic</FontFamily>
   <FontFamily x:Key="MonoFont">Cascadia Mono, Consolas, Malgun Gothic</FontFamily>
 
   <Style x:Key="H1" TargetType="TextBlock">
