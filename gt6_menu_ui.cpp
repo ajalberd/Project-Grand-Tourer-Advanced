@@ -48,6 +48,7 @@ extern float rsx_window_aspect;
 extern int rsx_live_draw_present_stretch;
 int gt6_res_1080(void);     /* main.cpp: 1 = this run is in the game's 1080p mode */
 int gt6_real_res(void);     /* main.cpp [GT6 0102]: this run's real resolution (Settings::realRes, 0 = off) */
+int gt6_lan_mode(void);     /* main.cpp [GT6 0114]: this run is in LAN mode */
 }
 
 using namespace gt6menu;
@@ -853,12 +854,35 @@ void pageSettings(Settings& s)
                 ImGui::PopID();
             }
         }
+        // [GT6 0113] Looser Chase Camera (public issue #7; the RPCS3 patch for 1.22 by Edo), live
+        if (rowSlider(T_("느슨한 추적 카메라: 스프링 감쇠"), T_("추적(체이스) 카메라가 차를 덜 딱딱하게 따라갑니다 — 오른쪽 스위치로 켭니다. 낮을수록 "
+                                                       "느슨합니다(게임 기본 300). RPCS3 패치 \"Looser Chase Camera\"(Edo)와 같습니다."),
+                      &s.camLoose, &s.camSpring, 0.0, 300.0, 0.0, 300.0, "%.0f"))
+            U.dirty = true;
+        if (rowSlider(T_("느슨한 추적 카메라: 최대 각도"), T_("카메라가 차 뒤에서 옆으로 돌아갈 수 있는 가장 큰 각도입니다(게임 기본 30)."),
+                      nullptr, &s.camAngle, 0.0, 100.0, 0.0, 100.0, "%.0f", true))
+            U.dirty = true;
         endRows();
     }
     if (s.fullHd != (gt6_res_1080() != 0))
         note(s.fullHd ? T_("게임을 다시 실행하면 1080p로 켜집니다.") : T_("게임을 다시 실행하면 720p로 켜집니다."), kFaint);
     else if (s.fullHd && s.realRes != gt6_real_res())
         note(T_("게임을 다시 실행하면 새 실제 해상도로 그립니다."), kFaint);
+    endCard();
+
+    // [GT6 0114] LAN play without PSN (the game's hidden "lanmode"; Mabec's GT6 PC build brought it back on RPCS3)
+    beginCard("net", T_("네트워크"));
+    if (beginRows("n")) {
+        U.dirty |= rowToggle(T_("LAN 모드 (같은 네트워크의 PC끼리 대전)"),
+                             T_("게임 자체의 숨은 LAN 모드로 켭니다(다음 실행부터). 모든 PC가 같은 버전 · 같은 지역이어야 합니다. 처음 한 번: "
+                                "마이 홈에서 R1을 누른 채 SELECT(키보드: E를 누른 채 Space 1초)로 개발자 설정 → Tutorial → Complete All → "
+                                "저장하면 Open Lobby가 열립니다(그 메뉴의 Misc → Delete Save Data는 절대 쓰지 마세요). 호스트: Open Lobby → "
+                                "Create New → Create Room, 나머지: 목록의 방에 들어가기. 방화벽에서 이 게임의 개인 네트워크 연결을 허용하세요."),
+                             &s.lanMode);
+        endRows();
+    }
+    if (s.lanMode != (gt6_lan_mode() != 0))
+        note(s.lanMode ? T_("게임을 다시 실행하면 LAN 모드로 켜집니다.") : T_("게임을 다시 실행하면 LAN 모드가 꺼집니다."), kFaint);
     endCard();
 
 

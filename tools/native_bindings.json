@@ -126,5 +126,100 @@
     "file": "ppu_recomp_010.cpp"
    }
   ]
+ },
+ {
+  "site": "002F6B84",
+  "word": "D1890004",
+  "anchor": "{ float ftmp = (float)ctx->fpr[12]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[9] + 0x4, tmp); }",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "002F6B30",
+    "file": "ppu_recomp_008.cpp"
+   }
+  ]
+ },
+ {
+  "site": "002F71BC",
+  "word": "D00B0020",
+  "anchor": "{ float ftmp = (float)ctx->fpr[0]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[11] + 0x20, tmp); }",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "002F6DBC",
+    "file": "ppu_recomp_008.cpp"
+   },
+   {
+    "entry": "002F7170",
+    "file": "ppu_recomp_051.cpp"
+   }
+  ]
+ },
+ {
+  "site": "00A0BDAC",
+  "word": "7C63F038",
+  "anchor": "ctx->gpr[3] = ctx->gpr[3] & ctx->gpr[30];",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "00A0BD24",
+    "file": "ppu_recomp_030.cpp"
+   }
+  ]
+ },
+ {
+  "site": "00A0BF50",
+  "word": "7C63F038",
+  "anchor": "ctx->gpr[3] = ctx->gpr[3] & ctx->gpr[30];",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "00A0BEC8",
+    "file": "ppu_recomp_030.cpp"
+   }
+  ]
+ },
+ {
+  "site": "0081715C",
+  "word": "4807972D",
+  "anchor": "ctx->lr = 0x00817160; func_00890888(ctx); DRAIN_TRAMPOLINE(ctx);",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "00817140",
+    "file": "ppu_recomp_024.cpp"
+   }
+  ]
+ },
+ {
+  "site": "00B69768",
+  "word": "807F0024",
+  "anchor": "ctx->gpr[3] = vm_read32(ctx->gpr[31] + 0x24);",
+  "before": "vm_write32(ctx->gpr[29] + 0x44, ctx->gpr[0]);\n        ",
+  "after": "",
+  "copies": [
+   {
+    "entry": "00B69488",
+    "file": "ppu_recomp_034.cpp"
+   }
+  ]
+ },
+ {
+  "site": "009E66B0",
+  "word": "5463063E",
+  "anchor": "ctx->gpr[3] = ppc_rlw64(ctx->gpr[3], 0, 24, 31, 0, 0);",
+  "before": "ctx->lr = 0x009E66B0; func_00AE625C(ctx); DRAIN_TRAMPOLINE(ctx);\n        ",
+  "after": "",
+  "copies": [
+   {
+    "entry": "009E6210",
+    "file": "ppu_recomp_029.cpp"
+   }
+  ]
  }
 ]

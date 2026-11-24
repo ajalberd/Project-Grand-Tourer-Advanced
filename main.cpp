@@ -167,14 +167,15 @@ extern "C" int rsx_live_draw_present_stretch;       /* rsx_live_draw.c: the scan
 extern "C" float rsx_live_draw_present_aspect;      /* rsx_live_draw.c: custom display aspect ratio (0 = 16:9) */
 extern "C" float rsx_window_aspect;                 /* rsx_null_backend.c: custom window aspect ratio (0 = 16:9) */
 extern "C" float g_gt6_aspect;                      /* gt6_host.cpp: 3D projection aspect override at 0x008A615C */
-extern "C" int   g_gt6_lan;                         /* gt6_host.cpp: LAN mode patches (0x00A0BDAC/BF50, 0x00B69768) */
-extern "C" int   g_gt6_dev_menu;                    /* gt6_host.cpp: Develop Settings (0x0081715C) */
 extern "C" void rsx_live_draw_upscale(float ux, float uy);       /* rsx_live_draw.c [GT6 0102] */
 extern "C" void rsx_live_draw_upscale_size(unsigned w, unsigned h);
 extern "C" int gt6_res_1080(void) { return g_gt6_res_1080; }   /* (the menu shows which mode this run is in) */
 static int g_gt6_real_res = 0;                      /* [GT6 0102] 0 = off, 1 = 1920x1080, 2 = 2560x1440, 3 = 3840x2160 */
 extern "C" int gt6_real_res(void) { return g_gt6_real_res; }
+static int g_gt6_lan = 0;                             /* [GT6 0114] this run boots with "lanmode" */
+extern "C" int gt6_lan_mode(void) { return g_gt6_lan; }
 extern "C" int gt6_menu_setting_real_res(void);     /* gt6_menu_engine.cpp */
+extern "C" int gt6_menu_setting_lan_mode(void);     /* gt6_menu_engine.cpp [GT6 0114] */
 extern "C" void rsx_live_draw_reports_tick(void);   /* rsx_live_draw.c: ZPASS counts the title may be waiting for [0056] */
 extern "C" int g_spu_force_ch_block;        /* runtime/spu/spu_channels.c: an empty SPU channel read sleeps */
 static long long s_last_pending_present = 0;
@@ -925,19 +926,15 @@ int main(int argc, char** argv)
     /* Defaults a plain start needs (the environment still overrides each):
      * argv[0] as the loader EBOOT hands it to EMAIN, and the live renderer. */
     if (!getenv("PS3_BOOT_PATH")) _putenv_s("PS3_BOOT_PATH", "/dev_hdd0/game/BCES01893/USRDIR/EMAIN.SELF");
-
-    /* GT6_DEV_MENU=1: Develop Settings (R1+SELECT at My Home -> Tutorial -> Complete All).
-     * GT6_LAN=1: hidden LAN mode ("lanmode" argv, room-sync + member-info patches, Winsock2 sockets, no PSN). */
+    /* [GT6 0114] LAN MODE (Settings -> Network / Launcher LAN Multiplayer; hidden boot argument "lanmode" with
+     * network up and no PSN, plus GT6_LAN_BIND -> PS3_NET_BIND_IP and GT6_LAN_NAME -> PS3_NP_ONLINE_ID). */
     { const char* dm = getenv("GT6_DEV_MENU");
-      if (dm && *dm == '1') {
-          g_gt6_dev_menu = 1;
+      if (dm && *dm == '1')
           fprintf(stderr, "[gt6] Develop Settings enabled (GT6_DEV_MENU=1)\n");
-      }
-      const char* lan = getenv("GT6_LAN");
-      if (lan && *lan == '1') {
+      const char* e = getenv("GT6_LAN");
+      const int lan = e && *e ? atoi(e) != 0 : gt6_menu_setting_lan_mode() != 0;
+      if (lan) {
           g_gt6_lan = 1;
-          g_gt6_dev_menu = 1;
-          _putenv_s("PS3_NET_ONLINE", "1");
           const char* cur_argv = getenv("PS3_ARGV");
           if (!cur_argv || !*cur_argv) {
               _putenv_s("PS3_ARGV", "lanmode");
@@ -946,6 +943,7 @@ int main(int argc, char** argv)
               snprintf(buf, sizeof(buf), "%s;lanmode", cur_argv);
               _putenv_s("PS3_ARGV", buf);
           }
+          if (!getenv("PS3_NET_ONLINE")) _putenv_s("PS3_NET_ONLINE", "1");
           const char* bind_ip = getenv("GT6_LAN_BIND");
           if (bind_ip && *bind_ip && !getenv("PS3_NET_BIND_IP"))
               _putenv_s("PS3_NET_BIND_IP", bind_ip);
@@ -953,22 +951,17 @@ int main(int argc, char** argv)
           if (lan_name && *lan_name && !getenv("PS3_NP_ONLINE_ID"))
               _putenv_s("PS3_NP_ONLINE_ID", lan_name);
           if (!getenv("PS3_NP_ONLINE_ID") || !*getenv("PS3_NP_ONLINE_ID")) {
-              const char* host = getenv("COMPUTERNAME");
-              if (host && *host) {
-                  char clean[17]; size_t n = 0;
-                  for (const char* p = host; *p && n < 16; p++) {
-                      unsigned char c = (unsigned char)*p;
-                      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')
-                          clean[n++] = (char)c;
-                  }
-                  clean[n] = '\0';
-                  if (n > 0) _putenv_s("PS3_NP_ONLINE_ID", clean);
-              }
+              char name[17] = {0}; int n = 0;
+              const char* pc = getenv("COMPUTERNAME");
+              for (; pc && *pc && n < 16; pc++)
+                  if (isalnum((unsigned char)*pc) || *pc == '-' || *pc == '_') name[n++] = *pc;
+              if (n < 3 || !isalpha((unsigned char)name[0])) { memmove(name + 3, name, 13); memcpy(name, "GT6", 3); name[16] = 0; }
+              _putenv_s("PS3_NP_ONLINE_ID", name);
           }
-          fprintf(stderr, "[gt6-lan] LAN mode enabled (argv=%s, bind=%s, user=%s)\n",
-                  getenv("PS3_ARGV") ? getenv("PS3_ARGV") : "",
+          fprintf(stderr, "[gt6] LAN mode: boot argument \"%s\", bind \"%s\", network on, player \"%s\"\n",
+                  getenv("PS3_ARGV"),
                   getenv("PS3_NET_BIND_IP") ? getenv("PS3_NET_BIND_IP") : "auto",
-                  getenv("PS3_NP_ONLINE_ID") ? getenv("PS3_NP_ONLINE_ID") : "default");
+                  getenv("PS3_NP_ONLINE_ID"));
       } }
     if (!getenv("RSX_LIVE_DRAW")) _putenv_s("RSX_LIVE_DRAW", "1");
     /* Retain unchanged vertex arrays on the GPU. LD_VTX_SLAB=0 keeps the

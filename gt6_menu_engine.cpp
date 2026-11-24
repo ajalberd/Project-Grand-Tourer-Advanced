@@ -244,6 +244,45 @@ void wpf32(uint32_t a, float f)
 }
 bool bridgeReady() { return vm_base && __atomic_load_n(&gt6_trainer_bridge.ready, __ATOMIC_ACQUIRE) != 0; }
 
+// [GT6 0113] Looser Chase Camera (Settings -> Display; public issue #7): the switch and its two values for the bridge
+// (gt6_trainer.cpp chase_cam, P + 0x300 / + 0x304 / + 0x308), and the camera table itself (0x016DDFF0) at once when they
+// change - with it on the game's own stores are answered by the bridge; off, the game's numbers go back: the init's source
+// (0x01130160, 32 bytes) and the camera parameters' + 0x54 / + 0x58 / + 0x60 (0x016E632C) as func_002F6B30 writes them.
+void cameraTick(const Settings& s)
+{
+    if (!bridgeReady())
+        return;
+    const float spring = (float)std::clamp(std::isfinite(s.camSpring) ? s.camSpring : 90.0, 0.0, 300.0);
+    const float angle = (float)std::clamp(std::isfinite(s.camAngle) ? s.camAngle : 35.0, 0.0, 100.0);
+    wpf32(P + 0x304, spring);
+    wpf32(P + 0x308, angle);
+    wp32(P + 0x300, s.camLoose ? 1u : 0u);
+    static int last = -1;
+    static float lastSpring = -1.0f, lastAngle = -1.0f;
+    const int on = s.camLoose ? 1 : 0;
+    if (on == last && spring == lastSpring && angle == lastAngle)
+        return;
+    constexpr uint32_t T = 0x016DDFF0u, Init = 0x01130160u, Prm = 0x016E632Cu;
+    if (on) {
+        wpf32(T + 4, spring);
+        wpf32(T + 8, 200.0f);
+        wp32(T + 12, 0);
+        wpf32(T + 20, angle);
+        wpf32(T + 24, 20.0f);
+        wp32(T + 28, 0);
+    } else if (last == 1) {
+        for (uint32_t i = 0; i < 32; i += 4)
+            wp32(T + i, p32(Init + i));
+        wp32(T, p32(Prm + 0x54));
+        wp32(T + 4, p32(Prm + 0x58));
+        wp32(T + 16, p32(Prm + 0x60));
+        wp32(T + 20, p32(Prm + 0x60));
+    }
+    last = on;
+    lastSpring = spring;
+    lastAngle = angle;
+}
+
 // Committed, readable guest memory (Rpcs3Memory.Regions): the RSX range 0xC0000000..0xD0000000 is left out.
 struct Region {
     uint64_t lo, hi;
@@ -760,6 +799,10 @@ std::string settingsToJson(const Settings& s)
     w.kv("MenuFullHd", s.fullHd);
     w.kv("ScreenRealRes", s.realRes);
     w.kv("ScreenBright", s.screenBright);
+    w.kv("CameraLooseChase", s.camLoose);
+    w.kv("CameraChaseSpring", s.camSpring);
+    w.kv("CameraChaseAngle", s.camAngle);
+    w.kv("NetLanMode", s.lanMode);
     w.kv("MenuLang", s.menuLang);
     w.kv("MenuLastPage", s.lastPage);
     w.close('}');
@@ -823,6 +866,12 @@ void settingsFromJson(const J& j, Settings& s, bool menuKeys)
         I("ScreenRealRes", s.realRes);
         s.realRes = std::clamp(s.realRes, 0, 3);
         D("ScreenBright", s.screenBright);
+        B("CameraLooseChase", s.camLoose);
+        D("CameraChaseSpring", s.camSpring);
+        s.camSpring = std::clamp(std::isfinite(s.camSpring) ? s.camSpring : 90.0, 0.0, 300.0);
+        D("CameraChaseAngle", s.camAngle);
+        s.camAngle = std::clamp(std::isfinite(s.camAngle) ? s.camAngle : 35.0, 0.0, 100.0);
+        B("NetLanMode", s.lanMode);
         I("MenuLang", s.menuLang);
         s.menuLang = std::clamp(s.menuLang, 0, 2);
         I("MenuLastPage", s.lastPage);
@@ -867,6 +916,22 @@ extern "C" int gt6_menu_setting_real_res(void)
         if (!x || x->t != J::Num) return 0;
         const int v = (int)x->n;
         return v >= 0 && v <= 3 ? v : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// [GT6 0114] LAN mode (Settings -> Network; Mabec's GT6 PC build brought it to RPCS3): read by main.cpp at its start like
+// the two above - the game takes its hidden "lanmode" boot argument then. No file, a broken file or no such key = off.
+extern "C" int gt6_menu_setting_lan_mode(void)
+{
+    try {
+        std::string text;
+        J j;
+        if (!readFile(settingsPath(), text) || !jsonParse(text, j) || j.t != J::Obj)
+            return 0;
+        const J* x = j.get("NetLanMode");
+        return x && x->t == J::Bool && x->b ? 1 : 0;
     } catch (...) {
         return 0;
     }
@@ -975,12 +1040,20 @@ std::optional<long long> read(uint32_t obj)
     return v >= 0 && v <= Max ? std::optional<long long>(v) : std::nullopt;
 }
 
+// (An earlier answer to public issue #8, [GT6 0115], also wrote a 64-bit word in the game's heap that held the old value
+// between two heap pointers, taking it for the copy the shop reads. It was not: test cs1 found such a word once and no
+// more of them fifteen seconds later - a freed temporary of the script engine. That write is gone; the real cause is the
+// game's bank book, gt6_menu_bank_book below.)
 bool write(uint32_t obj, long long v)
 {
-    if (v < 0 || v > Max || !read(obj))
+    const auto before = read(obj);
+    if (v < 0 || v > Max || !before)
         return false;
     return w64(obj + Off, (uint64_t)v);
 }
+
+// The object the engine found (0 = none yet), for gt6_menu_bank_book: that one runs on the game's own thread.
+std::atomic<uint32_t> g_shared{0};
 
 // [GT6 0108] (tests, GT6_CASH_LOG=1) A player: credits set in the menu showed in the game, but the parts shop said
 // "Insufficient credits", the lock did not help either. Every object with the tag (find() takes the first), and every
@@ -1022,6 +1095,46 @@ void diag(uint32_t obj)
     scanValue(*v, "value");
 }
 
+// The header of a bank book in `b` (the game's script structure BankBook: version 101, then the amount before, the
+// change, the amount after and the time as 64-bit words, the place in its history and the number of times that
+// history went round as 32-bit words): 1 = these bytes are one.
+bool isBook(const uint8_t* b, long long* prev, long long* diff, long long* cur)
+{
+    auto q = [&](int o) { return (long long)((uint64_t)rbe32(b + o) << 32 | rbe32(b + o + 4)); };
+    if (q(0) != 101)
+        return false;
+    *prev = q(8); *diff = q(16); *cur = q(24);
+    const long long when = q(32);
+    return *prev >= 0 && *prev <= Max && *cur >= 0 && *cur <= Max && *diff >= -Max && *diff <= Max && when > 0 &&
+           rbe32(b + 40) < 256u && rbe32(b + 44) < 0x100000u;
+}
+
+// (tests, GT6_CASH_LOG) The bank book as the game holds it in memory behind the credits object: a line when it changes.
+void bookLog(uint32_t obj)
+{
+    static std::vector<uint8_t> buf(0x10000);
+    static uint8_t last[0x30];
+    static uint64_t next = 0;
+    if (GetTickCount64() < next)
+        return;
+    next = GetTickCount64() + 1000;
+    for (size_t o = 0; o < buf.size(); o += 0x1000)          // page by page: a page that cannot be read stays zero
+        if (!rd(obj + (uint32_t)o, buf.data() + o, 0x1000))
+            std::memset(buf.data() + o, 0, 0x1000);
+    for (size_t o = 0; o + 0x30 <= buf.size(); o += 8) {
+        long long prev, diff, cur;
+        if (!isBook(buf.data() + o, &prev, &diff, &cur))
+            continue;
+        if (std::memcmp(last, buf.data() + o, 0x30)) {
+            std::memcpy(last, buf.data() + o, 0x30);
+            const auto v = read(obj);
+            fprintf(stderr, "[cash] bank book in memory at %08X: before %lld, change %lld, after %lld, place %u (credits now %lld)\n",
+                    obj + (uint32_t)o, prev, diff, cur, rbe32(buf.data() + o + 40), v ? *v : -1LL);
+        }
+        return;
+    }
+}
+
 void testStep(uint32_t obj)
 {
     static const bool on = getenv("GT6_CASH_LOG") != nullptr;
@@ -1029,6 +1142,7 @@ void testStep(uint32_t obj)
     static uint64_t again = 0, foundAt = 0;
     if (!on || !obj)
         return;
+    bookLog(obj);
     // GT6_CASH_TEST_AFTER=<s>: the first look and the write that long after the object was found (not while a save loads)
     if (!foundAt)
         foundAt = GetTickCount64();
@@ -1054,6 +1168,66 @@ void testStep(uint32_t obj)
     }
 }
 }  // namespace cash
+
+// [GT6 0120] THE GAME'S BANK BOOK (public issue #8: credits set in the menu showed in the game, the parts shop said
+// "Insufficient credits", the lock did not help). Next to the credits the game keeps a "bank book" - the amount before,
+// the change and the amount after of everything it paid out or took itself - sealed with its own cipher. Before it takes
+// a payment it opens the sealed book, and when the credits are more than the book's amount it sets them back to that
+// amount. What the game adds itself (a prize) goes into the book without that look, which is why a value set in the menu
+// did work once a prize had been paid. The game bridge calls this where the cipher has just opened a sealed block (site
+// 0x009E66B0, on the game's own thread): `plain` are the opened bytes in guest memory. When they are a bank book whose
+// amount is below the credits the menu's object holds, the amount becomes the credits; the game's own look then passes,
+// and it writes the payment into the book and seals it as it always does. Nothing else of the block is touched, and a
+// block that is not a bank book is left alone. GT6_BANK_BOOK=0 = the book is left as it is (as before);
+// GT6_CASH_LOG=1: a line for every block the cipher opens.
+// Tests e6 / e7 (credits held at 48,144,100 by the lock, the book at 47,548,950, a car wash for 50 at Pit Service): with
+// GT6_BANK_BOOK=0 the game's book afterwards read "before 47,548,950, change -50, after 47,548,900" - it had set the
+// credits back to its own amount and charged from there; with this it read "before 48,144,100, change -50, after
+// 48,144,050".
+extern "C" void gt6_menu_bank_book(uint32_t plain, uint32_t size)
+{
+    static const bool log = getenv("GT6_CASH_LOG") != nullptr;
+    static const bool off = [] { const char* e = getenv("GT6_BANK_BOOK"); return e && *e == '0'; }();
+    static std::atomic<int> said{0};
+    uint8_t h[0x130];
+    if (off || size < 0x40u || size > 0x1000000u)
+        return;
+    const uint32_t look = size < sizeof h ? size : (uint32_t)sizeof h;
+    if (!rd(plain, h, look))
+        return;
+    if (log && said.load() < 24) {
+        ++said;
+        fprintf(stderr, "[cash] the cipher opened %u bytes at %08X: %08X %08X %08X %08X %08X %08X %08X %08X\n", size, plain, rbe32(h),
+                rbe32(h + 4), rbe32(h + 8), rbe32(h + 12), rbe32(h + 16), rbe32(h + 20), rbe32(h + 24), rbe32(h + 28));
+        // (tests) GT6_CASH_DUMP=<file>: the first opened block as it is
+        if (const char* dump = getenv("GT6_CASH_DUMP"); dump && *dump && said.load() == 1) {
+            std::vector<uint8_t> all(size);
+            if (rd(plain, all.data(), size))
+                if (FILE* f = fopen(dump, "wb")) { fwrite(all.data(), 1, size, f); fclose(f); }
+        }
+    }
+    // The sealed book is the script structure written member by member (seen in test e2, 16384 bytes): 0E <length> 09 <11
+    // members>, then per member 07 <its number> <type> <value>, type 04 = a 64-bit value. Members 0 .. 3 are the amount
+    // before, the version (101), the amount after and the change.
+    auto q = [&](int o) { return (long long)((uint64_t)rbe32(h + o) << 32 | rbe32(h + o + 4)); };
+    auto member = [&](int o, int number) { return h[o] == 0x07 && h[o + 1] == number && h[o + 2] == 0x04; };
+    if (h[0] != 0x0E || h[5] != 0x09 || rbe32(h + 6) != 11u || !member(0x0A, 0) || !member(0x15, 1) || !member(0x20, 2) ||
+        !member(0x2B, 3) || q(0x18) != 101)
+        return;
+    const long long prev = q(0x0D), cur = q(0x23), diff = q(0x2E);
+    if (prev < 0 || prev > cash::Max || cur < 0 || cur > cash::Max || diff < -cash::Max || diff > cash::Max)
+        return;
+    const uint32_t obj = cash::g_shared.load();
+    const auto have = obj ? cash::read(obj) : std::nullopt;
+    if (!have) {
+        if (log) fprintf(stderr, "[cash] the bank book (amount %lld) was opened, the credits object is not known: left alone\n", cur);
+        return;
+    }
+    if (*have > cur && w64(plain + 0x23, (uint64_t)*have))
+        fprintf(stderr, "[cash] the game's bank book said %lld and the credits are %lld: the book now says %lld\n", cur, *have, *have);
+    else if (log)
+        fprintf(stderr, "[cash] the game's bank book says %lld, the credits are %lld: nothing to do\n", cur, *have);
+}
 
 
 // ---- the engine: MainForm's ticks ----------------------------------------------------------------------------
@@ -1382,6 +1556,7 @@ struct Engine {
             cashObj = cash::find();
             nextCashSearch = GetTickCount64() + 5000;
         }
+        cash::g_shared.store(cashObj);   // [GT6 0120] for the bank book look on the game's thread
         cash::testStep(cashObj);   // [GT6 0108] tests only (GT6_CASH_LOG)
         loadFileRules();
         writePPTable(s);
@@ -1466,6 +1641,7 @@ struct Engine {
             }
             // [GT6 0101] Brightness (Settings -> Display), live: the presenter draws the picture as out = in^(1 / b)
             rsx_live_draw_present_gamma = (float)(1.0 / std::clamp(std::isfinite(s.screenBright) ? s.screenBright : 1.0, 0.5, 2.0));
+            cameraTick(s);
             control(now, s);
             std::vector<Command> cmds;
             {

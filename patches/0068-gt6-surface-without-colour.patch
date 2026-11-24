@@ -1,0 +1,109 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 6ac8753..2b315ce 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -5455,6 +5455,34 @@ static int ld_surface_key_index_on(void)
+     return on;
+ }
+ 
++/* [GT6 0119] A SURFACE THAT HOLDS NO COLOUR STANDS FOR NOTHING AT ITS ADDRESS. A draw cannot write its colour target
++ * when no colour target is selected (SET_SURFACE_COLOR_TARGET none) or every channel is masked; the surface that is
++ * bound for such a draw then keeps what it held. Gran Turismo 6 renders its shadow map that way - depth only, colour
++ * target none - and the colour offset register it leaves unused holds 0, the address of display buffer 0. Every such
++ * draw used to mark the 1024x1024 surface made for that pass as drawn, so a surface nothing had ever written colour
++ * to was the newest one at address 0, and what reads that address got its empty pixels instead of the display
++ * buffer's: the game binds a 1x1 texture at offset 0 where a material has no shadow map of its own (the rear-view
++ * mirror lost its sunlight in one frame out of three - the frames in which display buffer 0 was not the one being
++ * drawn - public issue #10), and a draw into display buffer 0 that reads the picture under it got the empty surface
++ * instead of its own target. Now: such a draw or clear does not count as a write, and a surface without any colour
++ * write (draw, clear, copy, blit, upload) is not a candidate for a texture. LD_MASKED_DRAW_STAMP=1 = as before. */
++static int ld_masked_draw_stamp_all(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_MASKED_DRAW_STAMP"); on = e && *e == '1'; }
++    return on;
++}
++static int ld_surface_has_colour(const surface_t* s)
++{
++#if !defined(YZ_PERF_CLEAN)
++    return s->last_draw_generation || s->last_clear_generation || s->last_copy_generation || s->last_blit_generation ||
++           s->last_resolve_generation || s->last_other_generation || ld_masked_draw_stamp_all();
++#else
++    (void)s;
++    return 1;
++#endif
++}
++
+ static int ld_fragment_surface_find(const rsx_dsp_texture* t, u32 target, u32 tb_want, int by_fmt, int self_exact)
+ {
+     int sampled = -1;
+@@ -5471,6 +5499,7 @@ static int ld_fragment_surface_find(const rsx_dsp_texture* t, u32 target, u32 tb
+                 i == target)
+                 continue;
+             if (sf_i->guard_dead && ld_surface_guard_on()) continue;
++            if (!ld_surface_has_colour(sf_i)) continue;                                   /* [GT6 0119] */
+             if (pass == 0 && (sf_i->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u) != tb_want)
+                 continue;
+             if (sf_i->gw == t->width && sf_i->gh == t->height) { sampled = (int)i; break; }   /* [GT6 0102] guest sizes */
+@@ -5662,6 +5691,7 @@ static u32 ld_tex_texel_bytes(u32 format)
+     }
+ }
+ static u64 g_ld_swin_copies;
++static unsigned long long g_ld_masked_draws;   /* [GT6 0119] draws that could not write their colour target */
+ /* The surface's texels [ox, ox + w) x [oy, oy + h) into window k (the part that lies inside the surface). */
+ static void surface_window_copy(surface_t* s, u32 k)
+ {
+@@ -15436,6 +15466,24 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+               (g.surfaces[target].fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u) == tb_want;
+           sampled = ld_fragment_surface_find(&t, target, tb_want, by_fmt, self_exact);
+           if (sampled >= 0 && !ld_surface_alias_ok((u32)sampled, &t)) sampled = -1;   /* [GT6 0045] */
++          /* LD_ALIAS_PICK=<hex offset> (diagnostic): which surface a texture at that address reads, a line whenever
++           * a unit's answer changes - with every surface at the address, its last draw and its guard state. */
++          { static long pick_at = -2; static u32 pick_said; static int last_pick[16];
++            if (pick_at == -2) { const char* e = getenv("LD_ALIAS_PICK"); pick_at = (e && *e) ? (long)strtoul(e, NULL, 16) : -1;
++                                 for (int q = 0; q < 16; q++) last_pick[q] = -2; }
++            if (pick_at >= 0 && t.offset == (u32)pick_at && u < 16u && last_pick[u] != sampled && pick_said < 400u) {
++                last_pick[u] = sampled; pick_said++;
++                char line[640];
++                int n = snprintf(line, sizeof line, "[alias-pick] frame %u unit %u tex %u:0x%X fmt=0x%02X %ux%u, target %u:0x%X %ux%u -> %d;",
++                                 g_ld_frames, u, t.location, t.offset, t.format, t.width, t.height, g.surfaces[target].location,
++                                 g.surfaces[target].offset, g.surfaces[target].gw, g.surfaces[target].gh, sampled);
++                for (u32 i = 0; i < g.n_surfaces && n < (int)sizeof line - 96; i++)
++                    if (g.surfaces[i].location == t.location && g.surfaces[i].offset == t.offset)
++                        n += snprintf(line + n, sizeof line - (size_t)n, " [%u] %ux%u drawn %u%s%s", i, g.surfaces[i].gw, g.surfaces[i].gh,
++                                      (unsigned)g.surfaces[i].last_draw_generation, g.surfaces[i].guard_dead ? " dead" : "",
++                                      g.surfaces[i].guard_frame == g_ld_frames + 1u ? " this-frame" : "");
++                fprintf(stderr, "%s | draws that left their colour target alone so far: %llu\n", line, g_ld_masked_draws);
++            } }
+         }
+         /* LD_UVDBG=1: the texture coordinates of the draw that samples the PS1
+          * framebuffer. Placed here rather than in fetch_batches because that
+@@ -16120,7 +16168,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     } else {
+         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
+     }
+-    ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
++    /* [GT6 0119] a draw that cannot write the colour target leaves that target's surface as it was (see
++     * ld_surface_has_colour) */
++    if (ld_masked_draw_stamp_all() || (sf.color_target != 0u && (rsx_dsp_reg(&g.rsx, M_COLOR_MASK) & 0x01010101u) != 0u))
++        ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
++    else g_ld_masked_draws++;
+     for (u32 r = 1; r < n_mrt; r++)
+         ld_surface_note_write(mrt[r], LD_SURFACE_WRITE_DRAW);
+     if (current_zslot) {
+@@ -16284,7 +16336,14 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+         fflush(s_csv_file);
+     }
+     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
+-    if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
++    /* [GT6 0119] with no colour target selected there is no colour to clear (see ld_surface_has_colour) */
++    int colour_target = 1;
++    if (!ld_masked_draw_stamp_all()) {
++        rsx_dsp_surface csf;
++        rsx_dsp_get_surface(&g.rsx, &csf);
++        colour_target = csf.color_target != 0u;
++    }
++    if (colour_target && (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A))) {
+         const u32 c = rsx_dsp_clear_color(&g.rsx);
+         float col[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+                          (c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f };

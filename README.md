@@ -26,6 +26,7 @@ A native Windows PC port of **Gran Turismo 6** (PlayStation 3, Polyphony Digital
 
   RPCS3 is used only as a tool during the setup and is deleted afterwards. Everything happens out of sight; only a progress bar is shown. If the setup stops, starting it again continues where it stopped.
 - **In-game menu (F2):** credit lock, career and licence unlock, PP lock, and settings, in English or Korean.
+- **LAN mode** (F2 menu, Network): race other PCs on the same network with the game's own hidden LAN mode, no PSN needed. **Looser chase camera** (F2 menu, Display), with its two values.
 - **Launcher:** settings (Full HD and more), mods, save backups, logs, and automatic updates of the port.
 - **Mods:** the GT6 Career Mod with the Spec II mod is imported in one step. Mods never change the game data: the game reads them first, so switching them off gives the original game at once.
 - **Languages:** English and Korean (by Windows' language, or chosen in the launcher).
@@ -67,6 +68,7 @@ The launcher checks this repository's releases once a day. A newer release is do
 
 - **[RPCS3](https://github.com/RPCS3/rpcs3)**, the PlayStation 3 emulator. The launcher uses its official build during the setup to decrypt the game's executable and one firmware module, and deletes it afterwards. The build turns its community patches for GT6 1.22 (AlexHaust, illusion and others) into the port's switches, and RPCS3's work on how the PS3 runs Gran Turismo 6 was the reference for this port.
 - **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** by sp00nznet: the static recompiler and runtime the port is built on.
+- **[MABEC](https://github.com/Mabec-games/Gran-Turismo-6-PC)** (Gran Turismo 6 PC, a GT6 build for RPCS3): its LAN play without PSN - the hidden "lanmode" boot argument with the "LAN Room Sync Without PSN" patch by abowen and RPCS3's "Develop Settings" - is the base of the port's LAN mode; its notes also pointed to the "Looser Chase Camera" patch by Edo (the port's looser chase camera) and to the game's own way of setting credits. No code of it is used; the facts are, with thanks.
 - **[Dear ImGui](https://github.com/ocornut/imgui)**: the in-game menu.
 
 ## License
@@ -100,6 +102,7 @@ The launcher checks this repository's releases once a day. A newer release is do
 
 - **원클릭 설치**(런처의 **설치** 페이지): 디스크 이미지나 디스크 폴더를 스스로 찾고(또는 직접 고르고) 디스크의 파일을 꺼냅니다. 게임의 공식 업데이트 1.01~1.22(약 12.5 GB)와 PS3 시스템 소프트웨어를 소니 서버에서, 공식 RPCS3 빌드를 RPCS3의 GitHub 릴리스에서 받습니다. 모두 설치하고 검사한 뒤(포트를 만든 원본 파일과 SHA-256 비교), 게임이 첫 실행 때 하는 업데이트 합치기까지 끝냅니다. RPCS3는 설치하는 동안 도구로만 쓰고 끝나면 지웁니다. 모든 과정은 보이지 않는 곳에서 진행되고 진행 바만 보입니다. 중간에 멈춰도 다시 시작하면 멈춘 곳부터 이어집니다.
 - **게임 안 메뉴(F2):** 크레딧 고정, 커리어·라이선스 해제, PP 고정과 설정, 영어 또는 한국어.
+- **LAN 모드**(F2 메뉴의 네트워크): 게임 자체의 숨은 LAN 모드로 같은 네트워크의 PC끼리 대전합니다(PSN 필요 없음). **느슨한 추적 카메라**(F2 메뉴의 화면)와 그 두 값.
 - **런처:** 설정(Full HD 등), 모드, 세이브 백업, 로그, 포트 자동 업데이트.
 - **모드:** GT6 커리어 모드와 Spec II 모드를 한 번에 가져옵니다. 모드는 게임 데이터를 바꾸지 않고 게임이 먼저 읽게만 하므로, 끄면 바로 원래 게임입니다.
 - **언어:** 영어와 한국어(Windows 언어를 따르거나 런처에서 선택).
@@ -137,6 +140,7 @@ The launcher checks this repository's releases once a day. A newer release is do
 
 - **[RPCS3](https://github.com/RPCS3/rpcs3)**: PlayStation 3 에뮬레이터입니다. 런처는 설치하는 동안 RPCS3 공식 빌드로 게임의 실행 파일과 펌웨어 모듈 하나를 복호화하고, 끝나면 지웁니다. 빌드는 RPCS3의 GT6 1.22용 커뮤니티 패치(AlexHaust, illusion 외)를 포트의 스위치로 만들며, PS3가 그란 투리스모 6를 어떻게 돌리는지에 대한 RPCS3의 작업이 이 포트의 기준이 되었습니다.
 - **[ps3recomp](https://github.com/sp00nznet/ps3recomp)**(sp00nznet): 이 포트의 바탕인 정적 리컴파일러와 런타임입니다.
+- **[MABEC](https://github.com/Mabec-games/Gran-Turismo-6-PC)**(Gran Turismo 6 PC, RPCS3용 GT6 빌드): PSN 없는 LAN 플레이 - 숨은 부팅 인자 "lanmode"와 abowen의 "LAN Room Sync Without PSN" 패치, RPCS3의 "Develop Settings" - 가 포트 LAN 모드의 바탕이고, Edo의 "Looser Chase Camera" 패치(포트의 느슨한 추적 카메라)와 게임 자체의 크레딧 설정 방법도 그 기록에서 알았습니다. 그 코드는 쓰지 않았고 사실만 썼습니다. 감사합니다.
 - **[Dear ImGui](https://github.com/ocornut/imgui)**: 게임 안 메뉴입니다.
 
 ### 빌드(개요)와 라이선스

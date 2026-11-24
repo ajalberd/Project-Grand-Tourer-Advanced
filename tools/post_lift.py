@@ -41,21 +41,6 @@ audio_flow_done = 0
 ASPECT_CALL = CALL.format(0x008A615C, 'func_008FF168')
 ASPECT_HOOK = '        { extern void gt6_aspect_override(ppu_context*); gt6_aspect_override(ctx); } /*GT6_ASPECT*/\n'
 aspect_done = 0
-DEVMENU_CALL = CALL.format(0x00817160, 'func_00890888')
-DEVMENU_HOOK = ('        ctx->lr = 0x00817160; { extern int gt6_dev_menu_on(void); '
-                'if (gt6_dev_menu_on()) { ctx->gpr[3] = 1; } else { func_00890888(ctx); DRAIN_TRAMPOLINE(ctx); } } /*GT6_DEVMENU*/\n')
-devmenu_done = 0
-LAN_SYNC_OLD = ('        ctx->gpr[3] = ctx->gpr[3] & ctx->gpr[30];\n'
-                '        vm_write8(ctx->gpr[31] + 0x684F, ctx->gpr[3]);\n')
-LAN_SYNC_NEW = ('        { extern int gt6_lan_on(void); ctx->gpr[3] = gt6_lan_on() ? ctx->gpr[30] : (ctx->gpr[3] & ctx->gpr[30]); } /*GT6_LAN_SYNC*/\n'
-                '        vm_write8(ctx->gpr[31] + 0x684F, ctx->gpr[3]);\n')
-lan_sync_done = 0
-LAN_MEMBER_OLD = ('        ctx->gpr[3] = vm_read32(ctx->gpr[31] + 0x24);\n'
-                  '        ctx->lr = 0x00B69770; func_00B5B9C8(ctx); DRAIN_TRAMPOLINE(ctx);\n')
-LAN_MEMBER_NEW = ('        { extern void gt6_lan_member_info(ppu_context*); gt6_lan_member_info(ctx); } /*GT6_LAN_MEMBER*/\n'
-                  '        ctx->gpr[3] = vm_read32(ctx->gpr[31] + 0x24);\n'
-                  '        ctx->lr = 0x00B69770; func_00B5B9C8(ctx); DRAIN_TRAMPOLINE(ctx);\n')
-lan_member_done = 0
 AUDIO_FIFO_BEGIN = '        { extern void gt6_audio_output_begin(ppu_context*); gt6_audio_output_begin(ctx); } /*GT6_AUDIO_FIFO_BEGIN*/\n'
 AUDIO_FIFO_END = '        { extern void gt6_audio_output_complete(ppu_context*); gt6_audio_output_complete(ctx); } /*GT6_AUDIO_FIFO_END*/\n'
 audio_fifo_done = 0
@@ -335,21 +320,6 @@ for p in sorted(glob.glob(os.path.join(d, 'ppu_recomp_*.cpp'))):
     elif ASPECT_CALL in t:
         t = t.replace(ASPECT_CALL, ASPECT_CALL + ASPECT_HOOK)
         aspect_done += 1
-    if '/*GT6_DEVMENU*/' in t:
-        devmenu_done += t.count('/*GT6_DEVMENU*/')
-    elif DEVMENU_CALL in t:
-        t = t.replace(DEVMENU_CALL, DEVMENU_HOOK)
-        devmenu_done += 1
-    if '/*GT6_LAN_SYNC*/' in t:
-        lan_sync_done += t.count('/*GT6_LAN_SYNC*/')
-    elif LAN_SYNC_OLD in t:
-        lan_sync_done += t.count(LAN_SYNC_OLD)
-        t = t.replace(LAN_SYNC_OLD, LAN_SYNC_NEW)
-    if '/*GT6_LAN_MEMBER*/' in t:
-        lan_member_done += t.count('/*GT6_LAN_MEMBER*/')
-    elif LAN_MEMBER_OLD in t:
-        lan_member_done += t.count(LAN_MEMBER_OLD)
-        t = t.replace(LAN_MEMBER_OLD, LAN_MEMBER_NEW)
     t, audio_fifo_count = apply_audio_fifo(t)
     audio_fifo_done += audio_fifo_count
     t, frame_wait_count, frame_time_count = apply_frame_timing(t)
@@ -404,12 +374,6 @@ if audio_flow_done != 1:
     raise SystemExit(f'GT6_AUDIO_FLOW: expected exactly one completion hook, found {audio_flow_done}')
 if aspect_done != 1:
     raise SystemExit(f'GT6_ASPECT: expected exactly one aspect getter hook, found {aspect_done}')
-if devmenu_done != 1:
-    raise SystemExit(f'GT6_DEVMENU: expected exactly one Develop Settings hook, found {devmenu_done}')
-if lan_sync_done != 3:
-    raise SystemExit(f'GT6_LAN_SYNC: expected 3 room-sync sites (2 + 1 tail-entry copy), found {lan_sync_done}')
-if lan_member_done != 1:
-    raise SystemExit(f'GT6_LAN_MEMBER: expected exactly one member-info hook, found {lan_member_done}')
 if audio_fifo_done != 2:
     raise SystemExit(f'GT6_AUDIO_FIFO: expected exactly one begin/end pair, found {audio_fifo_done}')
 if frame_wait_done != 2 or frame_time_done != 1:

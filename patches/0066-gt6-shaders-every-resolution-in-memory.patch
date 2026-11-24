@@ -1,0 +1,315 @@
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index e0c8fc0..1c4c543 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -1888,6 +1888,47 @@ int rsx_fp_apply_wpos_scale(char* hlsl, u32 capacity, float sx, float sy)
+     return 1;
+ }
+ 
++/*
++ * WPOS on an upscaled target, by a constant [GT6 0112]: as rsx_fp_apply_wpos_scale, but the scale is read from the
++ * pixel constants (fp_wpos.xy = 1 / scale, 1 when the target is not upscaled) instead of being written into the text.
++ * The program's text - and so its compiled shader and its pipeline - is then one for every resolution: changing the
++ * real resolution no longer makes every full-screen pass a new pipeline. Only for the buffered form (the cbuffer that
++ * ends in fp_alpha, which the draw engine follows with fp_wpos); a program without WPOS is left byte-identical.
++ * Returns 1 when inserted, 0 when nothing to do, -1 on a text it cannot place the lines in.
++ */
++int rsx_fp_apply_wpos_scale_cb(char* hlsl, u32 capacity)
++{
++    static const char wpos_read[] = "_rsx_wpos(input.position)";
++    static const char alpha_decl[] = "    float4 fp_alpha;\n";
++    static const char wpos_decl[] = "    float4 fp_wpos;\n";
++    static const char line[] = "    input.position.xy = input.position.xy * fp_wpos.xy;\n";
++    static const char* const entries[] = { "main(PSInput input) : SV_TARGET {\n",
++                                           "main(PSInput input) {\n" };
++    if (!hlsl || !capacity) return -1;
++    size_t len = 0;
++    while (len < capacity && hlsl[len]) ++len;
++    if (len == capacity) return -1;
++    if (!strstr(hlsl, wpos_read)) return 0;
++    if (strstr(hlsl, "input.position.xy = input.position.xy *") || strstr(hlsl, wpos_decl)) return -1;
++    char* decl = strstr(hlsl, alpha_decl);
++    if (!decl) return -1;
++    const size_t nd = sizeof wpos_decl - 1, nl = sizeof line - 1;
++    if (len + nd + nl + 1 > capacity) return -1;
++    decl += sizeof alpha_decl - 1;                       /* the declaration after fp_alpha */
++    memmove(decl + nd, decl, len - (size_t)(decl - hlsl) + 1);
++    memcpy(decl, wpos_decl, nd);
++    len += nd;
++    char* body = NULL;
++    for (size_t i = 0; i < sizeof entries / sizeof entries[0] && !body; ++i) {
++        char* at = strstr(hlsl, entries[i]);
++        if (at) body = at + strlen(entries[i]);
++    }
++    if (!body || body < decl) return -1;
++    memmove(body + nl, body, len - (size_t)(body - hlsl) + 1);
++    memcpy(body, line, nl);
++    return 1;
++}
++
+ /* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and
+  * 32-bit exports bypass the integer framebuffer's RGB transfer function. */
+ int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format)
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index ba702c4..177c12a 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -109,6 +109,8 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+ int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy);
+ /* [GT6 0102] WPOS divided by a continuous host upscale (sx x sy), first thing in main; 0 = no WPOS read, -1 = no place */
+ int rsx_fp_apply_wpos_scale(char* hlsl, u32 capacity, float sx, float sy);
++/* [GT6 0112] the same from the pixel constants: fp_wpos.xy after fp_alpha (buffered programs) */
++int rsx_fp_apply_wpos_scale_cb(char* hlsl, u32 capacity);
+ 
+ /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
+  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index c49d6cc..d2933d9 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8014,6 +8014,7 @@ static void shader_disk_cache_make_parents(const char* dir)
+     }
+ }
+ 
++static void ld_mc_start(void);   /* [GT6 0112] (below) */
+ static int shader_disk_cache_prepare(void)
+ {
+     if (g_ld_shader_disk_ready >= 0)
+@@ -8053,9 +8054,108 @@ static int shader_disk_cache_prepare(void)
+     g_ld_shader_disk_ready = 1;
+     fprintf(stderr, "[shader-disk-cache] enabled dir='%s' version=%u\n",
+             g_ld_shader_disk_dir, SHADER_DISK_CACHE_VERSION);
++    ld_mc_start();                                     /* [GT6 0112] the whole cache into memory, in the background */
+     return 1;
+ }
+ 
++/* [GT6 0112] THE SHADER CACHE IN MEMORY (2026-11-24: shaders read in ahead, all of them, at the speed of a
++ * PC's SSD - a track loading like other PC games', not a PS3's). Test sh2 (a warm cache, 2560x1440): in the race's
++ * first frames about a thousand shaders were asked for, each read from its own file by a compile worker while its
++ * draw was left out - 3,274 draws left out over the race. Now, while the game boots, one thread reads every file of
++ * the disk cache into memory (an eighth of the PC's memory at most) and publishes the table once; from then on a
++ * shader whose file is there is taken from memory on the renderer at once (ld_ap_request) - its draw is made in the
++ * same frame. A shader that is not there goes to the workers as before. LD_SHADER_MEMORY=0 = off. */
++typedef struct ld_mc_entry {
++    struct ld_mc_entry* next;
++    u64 hash;
++    u32 length, blob_length, reserved;
++    char stage;
++    const u8* source;                  /* the file's source text, then its blob */
++} ld_mc_entry;
++#define LD_MC_BUCKETS 65536u
++static ld_mc_entry* g_ld_mc_bucket[LD_MC_BUCKETS];
++static volatile LONG g_ld_mc_ready;
++static u32 g_ld_mc_files, g_ld_mc_taken;
++static u64 g_ld_mc_bytes;
++static DWORD WINAPI ld_mc_thread(LPVOID unused)
++{
++    (void)unused;
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++    const ULONGLONG t0 = GetTickCount64();
++    MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
++    u64 budget = 1536ull << 20;
++    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys / 8u > budget) budget = ms.ullTotalPhys / 8u;
++    char pattern[MAX_PATH];
++    if (snprintf(pattern, sizeof pattern, "%s\\*.bin", g_ld_shader_disk_dir) >= (int)sizeof pattern) return 0;
++    WIN32_FIND_DATAA fd;
++    HANDLE find = FindFirstFileA(pattern, &fd);
++    u32 skipped = 0;
++    if (find != INVALID_HANDLE_VALUE) {
++        do {
++            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
++            const char st = fd.cFileName[0];
++            unsigned long long hash = 0; unsigned len = 0;
++            if ((st != 'P' && st != 'V') || sscanf(fd.cFileName + 1, "_%16llX_%8X.bin", &hash, &len) != 2) { skipped++; continue; }
++            const u64 size = ((u64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
++            if (size < sizeof(shader_disk_cache_header) || size > (8u << 20) || g_ld_mc_bytes + size > budget) { skipped++; continue; }
++            char path[MAX_PATH];
++            if (snprintf(path, sizeof path, "%s\\%s", g_ld_shader_disk_dir, fd.cFileName) >= (int)sizeof path) continue;
++            HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
++            if (h == INVALID_HANDLE_VALUE) { skipped++; continue; }
++            u8* data = (u8*)malloc((size_t)size + sizeof(ld_mc_entry));
++            DWORD got = 0;
++            const BOOL ok = data && ReadFile(h, data + sizeof(ld_mc_entry), (DWORD)size, &got, NULL) && got == (DWORD)size;
++            CloseHandle(h);
++            if (!ok) { free(data); skipped++; continue; }
++            shader_disk_cache_header hd;
++            memcpy(&hd, data + sizeof(ld_mc_entry), sizeof hd);
++            if (hd.magic != SHADER_DISK_CACHE_MAGIC || hd.version != SHADER_DISK_CACHE_VERSION || hd.stage != (u32)st ||
++                hd.source_hash != hash || hd.source_length != len || !hd.blob_length || hd.blob_length > SHADER_DISK_CACHE_MAX_BLOB ||
++                sizeof hd + (u64)hd.source_length + hd.blob_length > size) { free(data); skipped++; continue; }
++            ld_mc_entry* e = (ld_mc_entry*)data;
++            e->hash = hash; e->length = len; e->blob_length = hd.blob_length; e->reserved = hd.reserved; e->stage = st;
++            e->source = data + sizeof(ld_mc_entry) + sizeof hd;
++            const u32 b = (u32)(hash ^ (hash >> 32) ^ (u32)st) & (LD_MC_BUCKETS - 1u);
++            e->next = g_ld_mc_bucket[b]; g_ld_mc_bucket[b] = e;
++            g_ld_mc_files++; g_ld_mc_bytes += size;
++        } while (FindNextFileA(find, &fd));
++        FindClose(find);
++    }
++    MemoryBarrier();
++    InterlockedExchange(&g_ld_mc_ready, 1);
++    fprintf(stderr, "[shader-memory] %u shaders (%.0f MB) of the disk cache in memory in %llu ms (%u files left out); budget %.0f MB\n",
++            g_ld_mc_files, (double)g_ld_mc_bytes / 1048576.0, (unsigned long long)(GetTickCount64() - t0), skipped,
++            (double)budget / 1048576.0);
++    return 0;
++}
++static void ld_mc_start(void)
++{
++    const char* e = getenv("LD_SHADER_MEMORY");
++    if (e && *e == '0') return;
++    static int started;
++    if (started) return;
++    started = 1;
++    HANDLE t = CreateThread(NULL, 0, ld_mc_thread, NULL, 0, NULL);
++    if (t) CloseHandle(t);
++}
++/* a shader's blob from memory: its source must be the very text (the file's, as ld_scj_disk_load checks it) */
++static ID3DBlob* ld_mc_take(char stage, const char* source, u32 length, u64 hash, u32 vs_flags)
++{
++    if (!InterlockedCompareExchange(&g_ld_mc_ready, 0, 0)) return NULL;
++    const u32 b = (u32)(hash ^ (hash >> 32) ^ (u32)stage) & (LD_MC_BUCKETS - 1u);
++    for (const ld_mc_entry* e = g_ld_mc_bucket[b]; e; e = e->next) {
++        if (e->stage != stage || e->hash != hash || e->length != length) continue;
++        if (stage == 'V' && e->reserved && e->reserved != vs_flags) continue;
++        if (memcmp(e->source, source, length)) continue;
++        ID3DBlob* blob = NULL;
++        if (FAILED(D3DCreateBlob(e->blob_length, &blob)) || !blob) return NULL;
++        memcpy(blob->lpVtbl->GetBufferPointer(blob), e->source + e->length, e->blob_length);
++        g_ld_mc_taken++;
++        return blob;
++    }
++    return NULL;
++}
++
+ static int shader_disk_cache_path(
+     char path[MAX_PATH], u32 stage, u64 hash, u32 source_length)
+ {
+@@ -9918,7 +10018,12 @@ static ID3D12PipelineState* get_pso(
+         key = fnv1a(&clip_tag, sizeof(clip_tag), key);
+         key = fnv1a(&user_clip, sizeof(user_clip), key);
+     }
+-    if (g_ld_draw_up) {                          /* [GT6 0102] WPOS divided by the host scale */
++    if (g_ld_draw_up && ld_fp_constants_buffered()) {
++        /* [GT6 0112] the scale is a pixel constant (fp_wpos): one pipeline for every resolution. (Its own tag all the
++         * same: a recipe kept from before, under the key of a target that was not upscaled, has the text without it.) */
++        const u32 up_tag = 0x32535055u;          /* UPS2 */
++        key = fnv1a(&up_tag, sizeof(up_tag), key);
++    } else if (g_ld_draw_up) {                   /* [GT6 0102] WPOS divided by the host scale, in the text */
+         const u32 up_tag = 0x31535055u;          /* UPS1 */
+         key = fnv1a(&up_tag, sizeof(up_tag), key);
+         key = fnv1a(&g_up_x, sizeof(g_up_x), key);
+@@ -10118,7 +10223,13 @@ static ID3D12PipelineState* get_pso(
+ #endif
+     if (fi > 0 && ld_apply_alpha_coverage(ps_hlsl, sizeof ps_hlsl, rs.alpha_coverage_samples) < 0)
+         fi = -1;
+-    if (fi > 0 && g_ld_draw_up && rsx_fp_apply_wpos_scale(ps_hlsl, sizeof ps_hlsl, g_up_x, g_up_y) < 0) {
++    if (fi > 0 && ld_fp_constants_buffered()) {  /* [GT6 0112] every WPOS program reads its scale (1 or the host's) */
++        if (rsx_fp_apply_wpos_scale_cb(ps_hlsl, sizeof ps_hlsl) < 0) {
++            static u32 said;
++            if (PS3_LOG_FIRST(said, 4)) fprintf(stderr, "[upscale] a fragment program's WPOS could not take its scale constant: not drawn\n");
++            fi = -1;
++        }
++    } else if (fi > 0 && g_ld_draw_up && rsx_fp_apply_wpos_scale(ps_hlsl, sizeof ps_hlsl, g_up_x, g_up_y) < 0) {
+         static u32 said;                         /* [GT6 0102] */
+         if (PS3_LOG_FIRST(said, 4)) fprintf(stderr, "[upscale] a fragment program's WPOS could not be scaled: not drawn\n");
+         fi = -1;
+@@ -10326,6 +10437,8 @@ static int ld_ap_request(char stage, const char* source, u32 size, u64 hash, con
+         /* [GT6 0050] no file is read here: a prepared pull variant is in memory, anything else a worker reads
+          * (or compiles) while this frame goes on */
+         else if (stage == 'V') blob = ld_sp_take_ex(source, size, hash, 0);
++        /* [GT6 0112] ... unless the whole disk cache is in memory by now: then at once, in this frame */
++        if (!blob) blob = ld_mc_take(stage, source, size, hash, g_ld_scj_vs_cache_flags);
+         if (blob) shader_blob_cache_insert_accounted(cache, source, size, hash, blob, stage, seen);
+     }
+     if (blob) { blob->lpVtbl->Release(blob); return 2; }
+@@ -10475,9 +10588,10 @@ static void ld_ap_pump(void)
+         g_ld_ap.report_frame = g_ld_frames;
+         fprintf(stderr, "[async-pso] frame=%u pending=%u started=%llu finished=%llu ready-at-once=%llu sync-final=%llu "
+                         "refused=%llu draws-left-out=%llu longest=%u frames; blobs the workers read from disk %ld, "
+-                        "wrote %ld\n",
++                        "wrote %ld; taken from memory %u\n",
+                 g_ld_frames, g_ld_ap_count, g_ld_ap.started, g_ld_ap.finished, g_ld_ap.immediate, g_ld_ap.sync_final,
+-                g_ld_ap.refused, g_ld_ap.skipped_draws, g_ld_ap.max_frames, (long)g_ld_scj_loaded, (long)g_ld_scj_stored);
++                g_ld_ap.refused, g_ld_ap.skipped_draws, g_ld_ap.max_frames, (long)g_ld_scj_loaded, (long)g_ld_scj_stored,
++                g_ld_mc_taken);
+     }
+ }
+ 
+@@ -10494,7 +10608,7 @@ static int ld_upload_pixel_constants(u32* out_offset)
+      * constants so fp_alpha retains a valid 16-byte slot. */
+     const u32 value_slots =
+         g.fp_constants.count ? g.fp_constants.count : 1u;
+-    const u32 data_bytes = (value_slots + 1u) * 16u;
++    const u32 data_bytes = (value_slots + 2u) * 16u;   /* [GT6 0112] fp_alpha, then fp_wpos */
+     u32 offset = 0;
+     u32 allocation_bytes = 0;
+     int plan = rsx_fp_constant_ring_plan(
+@@ -10553,6 +10667,10 @@ static int ld_upload_pixel_constants(u32* out_offset)
+           window[1] = ((win >> 16) & 0xFu) ? -0.5f : 0.0f;
+           memcpy(destination + value_slots * 16u + sizeof(g.fp_alpha_ref), window, sizeof(window));
+       } }
++    {   /* [GT6 0112] fp_wpos.xy: 1 / the host scale of the target this draw goes into (rsx_fp_apply_wpos_scale_cb) */
++        const float wpos[2] = { g_ld_draw_up ? 1.0f / g_up_x : 1.0f, g_ld_draw_up ? 1.0f / g_up_y : 1.0f };
++        memcpy(destination + (value_slots + 1u) * 16u, wpos, sizeof(wpos));
++    }
+     g.ps_cb_used += allocation_bytes;
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.ps_constant_allocations++;
+diff --git a/libs/video/rsx_pso_warmup.h b/libs/video/rsx_pso_warmup.h
+index 94d1be6..6473d6c 100644
+--- a/libs/video/rsx_pso_warmup.h
++++ b/libs/video/rsx_pso_warmup.h
+@@ -17,13 +17,17 @@
+ #pragma comment(lib, "synchronization.lib")
+ #endif
+ 
+-/* Keep the startup driver-work budget unchanged. A learned catalog must not
+- * occupy the slots needed by exact pipelines first encountered during play. */
++/* A learned catalog must not occupy the slots needed by exact pipelines first
++ * encountered during play. [GT6 0112] (2026-11-24: every track's
++ * shaders ready before the drive, loaded as fast as a PC's SSD allows - not a
++ * PS3's budget) Startup takes the whole kept catalog up to 49,152 recipes (the
++ * test cache had reached the old 16,384 and the rest were built at first use,
++ * mid-race), with 8,192 left for pipelines first met in play. */
+ #ifndef LD_PW_STARTUP_LIMIT
+-#define LD_PW_STARTUP_LIMIT 16384u
++#define LD_PW_STARTUP_LIMIT 49152u
+ #endif
+ #ifndef LD_PW_RUNTIME_RESERVE
+-#define LD_PW_RUNTIME_RESERVE 4096u
++#define LD_PW_RUNTIME_RESERVE 8192u
+ #endif
+ #define LD_PW_LIMIT (LD_PW_STARTUP_LIMIT + LD_PW_RUNTIME_RESERVE)
+ #ifndef LD_PW_HASH
+@@ -32,7 +36,7 @@
+ /* Recipe persistence has its own per-run quota. Filling the resident table
+  * must not prevent a successful ordinary draw from teaching the next run. */
+ #ifndef LD_PW_MAX_NEW_RECORDS
+-#define LD_PW_MAX_NEW_RECORDS 4096u
++#define LD_PW_MAX_NEW_RECORDS 8192u
+ #endif
+ #if LD_PW_STARTUP_LIMIT == 0 || LD_PW_RUNTIME_RESERVE == 0 || LD_PW_LIMIT > 65535u
+ #error Invalid PSO startup/runtime limits for the uint16_t index
+@@ -46,7 +50,7 @@
+ #define LD_PW_MAGIC 0x31575047u /* GPW1 */
+ #define LD_PW_MAX_SHADER (4u * 1024u * 1024u)
+ #ifndef LD_PW_MAX_RETAINED
+-#define LD_PW_MAX_RETAINED (256ull * 1024u * 1024u)
++#define LD_PW_MAX_RETAINED (1024ull * 1024u * 1024u)   /* [GT6 0112] (256 MiB held 16,384 recipes' shaders at 210 MiB) */
+ #endif
+ #define LD_PW_MAX_QUEUED (32u * 1024u * 1024u)
+ 
+@@ -506,7 +510,12 @@ static void ld_pw_start(ID3D12Device* dev, ID3D12PipelineLibrary* lib,
+         (!CreateDirectoryA(g_ld_pw.dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)) return;
+     g_ld_pw.device = dev; g_ld_pw.library = lib;
+     g_ld_pw.roots[0] = root; g_ld_pw.roots[1] = point_root;
+-    unsigned count = 2;
++    /* [GT6 0112] a quarter of the processor's threads (2 .. 8): the catalog is built while the game boots and sits in
++     * its menus, and three times the recipes are not to take three times as long */
++    SYSTEM_INFO si; GetSystemInfo(&si);
++    unsigned count = si.dwNumberOfProcessors / 4u;
++    if (count < 2u) count = 2u;
++    if (count > 8u) count = 8u;
+     setting = getenv("LD_PSO_PREWARM_THREADS");
+     if (setting) { const int n = atoi(setting); if (n >= 1 && n <= 8) count = (unsigned)n; }
+     for (unsigned i = 0; i < count; ++i) {

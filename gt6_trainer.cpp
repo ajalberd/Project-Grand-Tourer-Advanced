@@ -170,6 +170,9 @@ extern "C" int gt6_trainer_init(void) {
         {0x003D31D4u,0xC02B1D1Cu},{0x003D3224u,0xC02B1D20u},
         {0x00C063D4u,0x7CC83378u},{0x000EDDF0u,0x38A00100u},
         {0x000EDDFCu,0x7FA4EB78u},
+        {0x002F6B84u,0xD1890004u},{0x002F71BCu,0xD00B0020u},
+        {0x00A0BDACu,0x7C63F038u},{0x00A0BF50u,0x7C63F038u},{0x0081715Cu,0x4807972Du},{0x00B69768u,0x807F0024u},
+        {0x009E66B0u,0x5463063Eu},
     };
     for (const auto& s : signatures) if (!range(s[0], 4) || r32(s[0]) != s[1]) {
         fprintf(stderr, "[trainer] disabled: unsupported EMAIN instruction at %08X\n", s[0]); return 0;
@@ -289,10 +292,100 @@ extern "C" int gt6_trainer_bypass(ppu_context* c, uint32_t site) {
     if (c && site == 0x003A3F20) return graph_walk_enter(c);
     return 0;
 }
+/* ---- Looser Chase Camera [GT6 0113, 2026-11-24] (public issue #7: the RPCS3 GT6 PC build has a looser chase camera) --------
+ * The RPCS3 patch "Looser Chase Camera" for 1.22 (author Edo, in RPCS3's patch.yml; facts used, no code copied): the chase
+ * camera's spring damper and its largest angle are two floats of the table at 0x016DDFF0 (+ 4 and + 0x14; the game's 300 and
+ * 30). func_002F7170 (also inside func_002F6DBC) fills the table's 32 bytes from 0x01130160 / 0x01130170, and
+ * func_002F6B30 writes + 4 and + 0x14 again from the camera parameters at 0x016E632C + 0x58 / + 0x60 each time; the patch
+ * takes those stores out (nop at 0x2F71B0 / 0x2F71B8 and 0x2F6B80 / 0x2F6B84) and puts its own numbers into the table.
+ * Here, with P + 0x300 bit 0 (the menu's switch, P + 0x304 / + 0x308 the two values), the table is given the patch's
+ * numbers right after the game's own stores (sites 0x002F71BC, the init's last store, and 0x002F6B84). */
+static void chase_cam(uint32_t site) {
+    if (!(r32(P + 0x300) & 1u)) return;
+    constexpr uint32_t T = 0x016DDFF0u;
+    if (!range(T, 0x20)) return;
+    const float spring = rf32(P + 0x304), angle = rf32(P + 0x308);
+    if (!(spring >= 0.0f && spring <= 300.0f) || !(angle >= 0.0f && angle <= 100.0f)) return;
+    static int said;
+    if (said < 4) { ++said; fprintf(stderr, "[camera] looser chase camera: the game wrote the table (site %08X: spring %.0f, angle %.0f) - now %.0f / %.0f\n",
+                                    site, rf32(T + 4), rf32(T + 20), spring, angle); }
+    if (site == 0x002F71BCu) { wf32(T, 30.0f); wf32(T + 8, 200.0f); w32(T + 12, 0); wf32(T + 16, 10.0f); wf32(T + 24, 20.0f); w32(T + 28, 0); }
+    wf32(T + 4, spring); wf32(T + 20, angle);
+}
+
+/* ---- LAN mode [GT6 0114, 2026-11-24] (Mabec's GT6 PC build for RPCS3 - credits in the README - and the patches it uses,
+ * "LAN Room Sync Without PSN" and RPCS3's "Develop Settings"; facts used, no code copied) -------------------------------------
+ * With the hidden boot argument "lanmode" (main.cpp, the menu's LAN switch) GT6 plays over the home network - but it keeps its
+ * "online" flag (r31 + 0x684F) at "network up AND signed in to PSN", so a host never shares its room and the others wait at
+ * "Creating room... Please wait": at 0x00A0BDAC and 0x00A0BF50 the flag is made "network up" alone (and r3,r3,r30 ->
+ * mr r3,r30). The game's developer settings (R1 + SELECT at My Home) are opened too - completing the tutorials there is
+ * what unlocks Open Lobby: the answer of func_00890888 at 0x0081715C is 1 (the patch's li r3,1). Only in LAN mode. */
+static bool lan_on() {
+    static const int on = [] { const char* a = getenv("PS3_ARGV"); return a && strstr(a, "lanmode") ? 1 : 0; }();
+    return on != 0;
+}
+/* [GT6 0114] "LAN Host Member Info" (abowen; cosmetic): the room's host showed the members who joined as blank, nameless
+ * entries. Where func_00B69488 has filled a member's node record (r29: its id at + 0, its name / address / MAC at + 0x70,
+ * 0x30 bytes), the entry of the host's member table ([r31 + 0x18] + 0xBC, 64 entries of 0x70; + 0x69 in use, + 0x40 the
+ * node id) gets those 0x30 bytes - what the patch's code cave at 0x00B69768 does, here after the instruction it kept
+ * (lwz r3,0x24(r31)). Only in LAN mode. */
+static void lan_member_info(ppu_context* c) {
+    if (!lan_on()) return;
+    const uint32_t r31 = (uint32_t)c->gpr[31], r29 = (uint32_t)c->gpr[29];
+    if (!range((uint64_t)r31 + 0x18, 4) || !range((uint64_t)r29, 0xA0)) return;
+    const uint32_t owner = r32(r31 + 0x18);
+    if (!range((uint64_t)owner + 0xBC, 4)) return;
+    uint32_t t = r32(owner + 0xBC);
+    if (!range((uint64_t)t, 64u * 0x70u)) return;
+    const uint32_t node = (uint32_t)vm_base[r29] << 8 | vm_base[r29 + 1];
+    for (int i = 0; i < 64; ++i, t += 0x70) {
+        if (!vm_base[t + 0x69] || r32(t + 0x40) != node) continue;
+        memcpy(vm_base + t, vm_base + r29 + 0x70, 0x30);
+        static int said;
+        if (said < 4) { ++said; fprintf(stderr, "[lan] member %u: name and address filled in the host's list\n", node); }
+        break;
+    }
+}
+static bool dev_menu_on() {
+    static const int on = [] { const char* d = getenv("GT6_DEV_MENU"); return (d && *d == '1') ? 1 : 0; }();
+    return on != 0;
+}
+static void lan_site(ppu_context* c, uint32_t site) {
+    if (site == 0x0081715Cu) {
+        if (!lan_on() && !dev_menu_on()) return;
+        static int said_dev;
+        if (!said_dev) { said_dev = 1; fprintf(stderr, "[lan] site 0081715C: developer settings on\n"); }
+        c->gpr[3] = 1;
+        return;
+    }
+    if (!lan_on()) return;
+    if (site == 0x00B69768u) { lan_member_info(c); return; }
+    static int said;
+    if (said < 3) { ++said; fprintf(stderr, "[lan] site %08X: the room follows 'network up'\n", site); }
+    c->gpr[3] = c->gpr[30];
+}
+
+/* ---- the game's bank book [GT6 0120, 2026-11-25, public issue #8] -------------------------------------------------------------
+ * Next to the credits Gran Turismo 6 keeps a "bank book" of every amount it paid out or took itself, sealed with its own cipher
+ * (the script class pdistd::MCipher). Before it takes a payment it opens the book, and when the credits are more than the book
+ * says it sets them back to the book's amount: credits set in the menu showed on screen, and the shop answered "Insufficient
+ * credits" for anything dearer than the old balance (the lock could not help - the game looks at the moment it pays).
+ * func_009E6210 is that class's "decrypt"; at 0x009E66B0 its worker (func_00AE625C) has just returned: r3 = it opened the
+ * block, r28 = the plain bytes, r29 = their size. The menu's engine looks at them there (gt6_menu_bank_book): a bank book
+ * whose amount is below the credits gets the credits as its amount, so the game's own check passes, and the game then writes
+ * the payment into the book and seals it as it always does. */
+extern "C" void gt6_menu_bank_book(uint32_t plain, uint32_t size);   /* gt6_menu_engine.cpp */
+
 extern "C" void gt6_trainer_after(ppu_context* c, uint32_t site) {
     if (site == 0x003A3E0C) { graph_search_leave(); return; }
     if (c) graph_search_selftest(c);
     if (!c || !ready()) return;
+    if (site == 0x002F6B84 || site == 0x002F71BC) { chase_cam(site); return; }   /* [GT6 0113] */
+    if (site == 0x009E66B0) {                                                    /* [GT6 0120] */
+        if ((c->gpr[3] & 0xFF) && range((uint64_t)(uint32_t)c->gpr[28], 0x30)) gt6_menu_bank_book((uint32_t)c->gpr[28], (uint32_t)c->gpr[29]);
+        return;
+    }
+    if (site == 0x00A0BDAC || site == 0x00A0BF50 || site == 0x0081715C || site == 0x00B69768) { lan_site(c, site); return; }   /* [GT6 0114] */
     if (site == 0x000EDDF0) { name_code = (uint32_t)c->gpr[3]; w32(P + 0x40, name_code); return; }
     if (site == 0x000EDDFC) {
         std::string name;

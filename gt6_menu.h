@@ -48,6 +48,10 @@ struct Settings {
     bool fullHd = false;           // the game's own 1080p mode from the next start on (main.cpp reads the file before the game boots)
     int realRes = 0;               // [GT6 0102] with fullHd: the game's 1440x1080 buffers drawn on the host at 0 = 1440x1080 (stretched,
                                    // as before), 1 = 1920x1080, 2 = 2560x1440, 3 = 3840x2160 - a real resolution (from the next start)
+    bool camLoose = false;         // [GT6 0113] Looser Chase Camera (public issue #7; the RPCS3 patch by Edo for 1.22): the chase
+    double camSpring = 90.0;       // camera's spring damper (the game's 300) and its largest angle (the game's 30) - gt6_trainer.cpp
+    double camAngle = 35.0;        // chase_cam, live
+    bool lanMode = false;          // [GT6 0114] LAN play without PSN (from the next start; main.cpp gt6_menu_setting_lan_mode)
     double screenBright = 1.0;     // Brightness (2026-11-24, a player's report: "image is very dim"): the picture goes to the window as
                                    // out = in^(1 / this) - 1 = as the game draws it, live [GT6 0101]
     int menuLang = 0;              // [GT6 0087] 0 = by Windows' display language, 1 = Korean, 2 = English (from the next start)

@@ -1,0 +1,169 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index d2933d9..6ac8753 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2491,6 +2491,7 @@ static void ld_zq_stats(void)
+  * command list submit/wait (simple synchronous model, like the harness)
+  * -----------------------------------------------------------------------*/
+ static void ld_tex_final_release(ID3D12Resource* r);
++static void ld_ph_release(ID3D12Resource* r);   /* [GT6 0117] (below) */
+ static void ld_flush(ld_flush_reason reason)
+ {
+ #if defined(YZ_PERF_PROFILE)
+@@ -2716,7 +2717,7 @@ static void ld_tex_final_release(ID3D12Resource* r)
+         g_tex_pool_drops++;
+         break;
+     }
+-    r->lpVtbl->Release(r);
++    ld_ph_release(r);      /* [GT6 0117] (a placed texture's block goes back) */
+ }
+ static ID3D12Resource* ld_tex_pool_take(u32 fmt, u32 w, u32 h, u32 layers, u32 mips)
+ {
+@@ -3027,8 +3028,147 @@ static int ld_texture_copy_level(ID3D12Resource* tex, u32 subresource,
+  * time is not the zeroing - so it stays OFF; LD_TEX_NOT_ZEROED=1 asks for it. If the flag is refused once, it is
+  * not asked for again. */
+ static int g_ld_tex_not_zeroed = -1;
++
++/* [GT6 0117] TEXTURES PLACED IN HEAPS MADE AHEAD (60 FPS work order, section 2: the start and the first lap made 904 ms
++ * and 2,519 ms of textures in test fp1, a committed resource each - a heap of its own, a kernel call, about 0.3 ms).
++ * Plain 2D textures and cubes (no render target, no depth) are now placed in 64 MB heaps (D3D12_HEAP_FLAG_ALLOW_ONLY_
++ * NON_RT_DS_TEXTURES) in blocks of 64 KB .. 16 MB by powers of two; a block comes back to its size's free list when the
++ * texture is finally released after its fence (ld_tex_final_release), so it is never written while the GPU may still
++ * read the old one. A texture that does not fit a block, or a heap that cannot be made, goes the committed way as
++ * before. LD_TEX_PLACED=0 = all committed. */
++#define LD_PH_HEAP_BYTES (64ull << 20)
++#define LD_PH_MAX_HEAPS 96u
++#define LD_PH_CLASSES 9u                     /* 64 KB << k, k = 0 .. 8 (16 MB) */
++#define LD_PH_MAP 131072u                    /* power of two */
++typedef struct { u32 heap, cls; u64 offset; } ld_ph_block;
++static struct {
++    int on;
++    ID3D12Heap* heaps[LD_PH_MAX_HEAPS];
++    u64 bump;                                /* the next free byte of the newest heap */
++    u32 n_heaps;
++    ld_ph_block* free_list[LD_PH_CLASSES];
++    u32 n_free[LD_PH_CLASSES], cap_free[LD_PH_CLASSES];
++    ID3D12Resource** keys;                   /* placed resource -> its block */
++    ld_ph_block* vals;
++    u32 count;
++    unsigned long long placed, fallback, freed;
++} g_ph;
++static int ld_ph_on(void)
++{
++    if (!g_ph.on) {
++        const char* e = getenv("LD_TEX_PLACED");
++        g_ph.on = (e && *e == '0') ? -1 : 1;
++        if (g_ph.on > 0) {
++            g_ph.keys = (ID3D12Resource**)calloc(LD_PH_MAP, sizeof *g_ph.keys);
++            g_ph.vals = (ld_ph_block*)calloc(LD_PH_MAP, sizeof *g_ph.vals);
++            if (!g_ph.keys || !g_ph.vals) g_ph.on = -1;
++        }
++    }
++    return g_ph.on > 0;
++}
++static u32 ld_ph_slot(const ID3D12Resource* r) { return (u32)(((uintptr_t)r >> 4) * 2654435761u) & (LD_PH_MAP - 1u); }
++static u32 ld_ph_find(const ID3D12Resource* r)
++{
++    u32 s = ld_ph_slot(r);
++    while (g_ph.keys[s] && g_ph.keys[s] != r) s = (s + 1u) & (LD_PH_MAP - 1u);
++    return s;
++}
++static int ld_ph_take_block(u32 cls, ld_ph_block* out)
++{
++    if (g_ph.n_free[cls]) { *out = g_ph.free_list[cls][--g_ph.n_free[cls]]; return 1; }
++    const u64 size = (64ull << 10) << cls;
++    if (!g_ph.n_heaps || g_ph.bump + size > LD_PH_HEAP_BYTES) {
++        if (g_ph.n_heaps >= LD_PH_MAX_HEAPS) return 0;
++        D3D12_HEAP_DESC hd = {0};
++        hd.SizeInBytes = LD_PH_HEAP_BYTES;
++        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
++        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
++        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
++        ID3D12Heap* h = NULL;
++        if (FAILED(g.dev->lpVtbl->CreateHeap(g.dev, &hd, &IID_ID3D12Heap, (void**)&h)) || !h) return 0;
++        g_ph.heaps[g_ph.n_heaps++] = h;
++        g_ph.bump = 0;
++    }
++    out->heap = g_ph.n_heaps - 1u; out->cls = cls; out->offset = g_ph.bump;
++    g_ph.bump += size;
++    return 1;
++}
++static void ld_ph_give_block(const ld_ph_block* b)
++{
++    const u32 c = b->cls;
++    if (g_ph.n_free[c] == g_ph.cap_free[c]) {
++        const u32 cap = g_ph.cap_free[c] ? g_ph.cap_free[c] * 2u : 256u;
++        ld_ph_block* n = (ld_ph_block*)realloc(g_ph.free_list[c], cap * sizeof *n);
++        if (!n) return;                      /* (lost to the heap: never written again) */
++        g_ph.free_list[c] = n; g_ph.cap_free[c] = cap;
++    }
++    g_ph.free_list[c][g_ph.n_free[c]++] = *b;
++}
++/* a placed texture in COPY_DEST, or S_FALSE when it is to be made the committed way */
++static HRESULT ld_tex_create_placed(const D3D12_RESOURCE_DESC* rd, ID3D12Resource** tex)
++{
++    *tex = NULL;
++    if (!ld_ph_on() || rd->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd->Flags != D3D12_RESOURCE_FLAG_NONE ||
++        rd->SampleDesc.Count != 1 || g_ph.count >= LD_PH_MAP / 2u)
++        return S_FALSE;
++    D3D12_RESOURCE_ALLOCATION_INFO ai;
++    g.dev->lpVtbl->GetResourceAllocationInfo(g.dev, &ai, 0, 1, rd);
++    if (ai.SizeInBytes == UINT64_MAX || !ai.SizeInBytes || ai.Alignment > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
++        return S_FALSE;
++    u32 cls = 0;
++    while (cls < LD_PH_CLASSES && ((64ull << 10) << cls) < ai.SizeInBytes) cls++;
++    if (cls >= LD_PH_CLASSES) return S_FALSE;
++    ld_ph_block b;
++    const int reused = g_ph.n_free[cls] != 0;
++    if (!ld_ph_take_block(cls, &b)) { g_ph.fallback++; return S_FALSE; }
++    const HRESULT hr = g.dev->lpVtbl->CreatePlacedResource(g.dev, g_ph.heaps[b.heap], b.offset, rd, D3D12_RESOURCE_STATE_COPY_DEST,
++                                                           NULL, &IID_ID3D12Resource, (void**)tex);
++    if (FAILED(hr) || !*tex) { *tex = NULL; ld_ph_give_block(&b); g_ph.fallback++; return S_FALSE; }
++    if (reused) {
++        /* the block held a texture before (released after its fence): the aliasing contract before the new one's
++         * first use, its full-level copies (every level fits the upload buffer in one copy) */
++        D3D12_RESOURCE_BARRIER ab = {0};
++        ab.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
++        ab.Aliasing.pResourceBefore = NULL;
++        ab.Aliasing.pResourceAfter = *tex;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &ab);
++    }
++    /* (a pointer the map still holds belongs to a placed texture released some other way: its block stays lost, never
++     * handed out twice) */
++    const u32 s = ld_ph_find(*tex);
++    if (!g_ph.keys[s]) g_ph.count++;
++    g_ph.keys[s] = *tex; g_ph.vals[s] = b; g_ph.placed++;
++    if ((g_ph.placed & 1023u) == 1u)
++        fprintf(stderr, "[tex-placed] %llu textures placed in %u heaps of 64 MB (%u live, %llu blocks back, %llu went the committed way), frame %u\n",
++                g_ph.placed, g_ph.n_heaps, g_ph.count, g_ph.freed, g_ph.fallback, g_ld_frames);
++    return S_OK;
++}
++/* the last reference of a texture goes: a placed one gives its block back (its fence has passed) */
++static void ld_ph_release(ID3D12Resource* r)
++{
++    if (g_ph.on > 0 && g_ph.count) {
++        u32 i = ld_ph_find(r);
++        if (g_ph.keys[i] == r) {
++            const ld_ph_block b = g_ph.vals[i];
++            g_ph.keys[i] = NULL;                      /* removed: the entries after it move up (linear probing) */
++            for (u32 j = (i + 1u) & (LD_PH_MAP - 1u); g_ph.keys[j]; j = (j + 1u) & (LD_PH_MAP - 1u)) {
++                const u32 k = ld_ph_slot(g_ph.keys[j]);
++                const int stays = (i <= j) ? (i < k && k <= j) : (i < k || k <= j);
++                if (stays) continue;
++                g_ph.keys[i] = g_ph.keys[j]; g_ph.vals[i] = g_ph.vals[j]; g_ph.keys[j] = NULL;
++                i = j;
++            }
++            g_ph.count--; g_ph.freed++;
++            r->lpVtbl->Release(r);
++            ld_ph_give_block(&b);
++            return;
++        }
++    }
++    r->lpVtbl->Release(r);
++}
+ static HRESULT ld_tex_create_committed(const D3D12_HEAP_PROPERTIES* hp, const D3D12_RESOURCE_DESC* rd, ID3D12Resource** tex)
+ {
++    if (ld_tex_create_placed(rd, tex) == S_OK) return S_OK;   /* [GT6 0117] */
+     if (g_ld_tex_not_zeroed < 0) { const char* e = getenv("LD_TEX_NOT_ZEROED"); g_ld_tex_not_zeroed = e && *e == '1'; }
+     if (g_ld_tex_not_zeroed) {
+         const HRESULT hr = g.dev->lpVtbl->CreateCommittedResource(g.dev, hp, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, rd,

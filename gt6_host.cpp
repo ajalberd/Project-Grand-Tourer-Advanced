@@ -435,35 +435,6 @@ void gt6_aspect_override(ppu_context* ctx)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * GT6_LAN / GT6_DEV_MENU: hidden LAN mode patches (BCES01893 1.22).
- *   - 0x0081715C (Develop Settings): unlocks R1+SELECT Develop Settings menu
- *   - 0x00A0BDAC & 0x00A0BF50 (LAN Room Sync Without PSN): follow network_up
- *   - 0x00B69768 (LAN Host Member Info): copy peer name/IP/MAC into member slot
- * -------------------------------------------------------------------------*/
-extern "C" int g_gt6_lan = 0;
-extern "C" int g_gt6_dev_menu = 0;
-
-int gt6_lan_on(void)      { return g_gt6_lan; }
-int gt6_dev_menu_on(void) { return g_gt6_dev_menu; }
-
-void gt6_lan_member_info(ppu_context* ctx)
-{
-    if (!g_gt6_lan) return;
-    uint32_t r11 = vm_read32((uint32_t)ctx->gpr[31] + 0x18u);
-    if (!r11) return;
-    r11 = vm_read32(r11 + 0xBCu);
-    if (!r11) return;
-    const uint32_t r29 = (uint32_t)ctx->gpr[29];
-    const uint32_t peer_id = vm_read16(r29);
-    for (int i = 0; i < 0x40; i++, r11 += 0x70u) {
-        if (vm_read8(r11 + 0x69u) == 0) continue;
-        if (vm_read32(r11 + 0x40u) != peer_id) continue;
-        for (uint32_t off = 0; off < 0x30u; off += 8u)
-            vm_write64(r11 + off, vm_read64(r29 + 0x70u + off));
-        break;
-    }
-}
 /* r3 = display buffer descriptor, r4 = scene buffer descriptor: { u32 address, u32 pitch, ..., u16 width @0x14,
  * u16 height @0x16, u16 viewport x0 @0x18, y0 @0x1A, x1 @0x1C, y1 @0x1E }. Sets up
  * func_00C3E050(dst address, dst pitch, dst x, dst y, src address, src pitch, src x, src y, width, height, 4)
@@ -894,14 +865,37 @@ int gt6_spurs_spus(void)
     return n;
 }
 
+/* GT6_SPURS_BG_SLOTS=<1..7> [GT6 0118] (a TEST switch; unset or 0 = the game's table): the background job list (header
+ * 0x0170F180, priority 7, job module 44ed3fe39dae) keeps only its last <n> SPU slots that have a thread, so the other
+ * SPUs never start one of its jobs and are free for the render jobs at once (SPURS does not take an SPU back in the
+ * middle of a job). Its maximum contention becomes the smaller of the game's and <n>; below its minimum the game's
+ * table stays. 60 FPS work order 5.1, Red Bull Ring, 16 cars, the 10 s after the start, <n> = 3: 37.9 -> 39.7 fps,
+ * P99 66 -> 54 ms (fp3 -> fp4); lap 2 the same.
+ * NOT A DEFAULT: with 3 the loading of a Free Run at Brands Hatch stood still for good in one run out of two (e10,
+ * 2026-11-25; no frame from then on) with the render thread polling at 0x008EB514 for a job of this very list - the
+ * game itself waits on these jobs while it loads. Why the job never came was not looked into. */
+static int gt6_spurs_bg_slots(void)
+{
+    static const int v = []() {
+        const char* e = getenv("GT6_SPURS_BG_SLOTS");
+        int k = (e && *e) ? atoi(e) : 0;
+        k = k < 0 ? 0 : k > 7 ? 7 : k;
+        if (k) fprintf(stderr, "[gt6-spurs] GT6_SPURS_BG_SLOTS=%d: the background job list keeps %d SPU slot(s)\n", k, k);
+        return k;
+    }();
+    return v;
+}
+
 /* After _cellSpursWorkloadAttributeInitialize in func_00B31A00: r29 = the CellSpursWorkloadAttribute on the caller's
  * stack (priority[8] at +0x18, minContention at +0x20, maxContention at +0x24, all big-endian), r3 = its result. */
 void gt6_spurs_joblist(ppu_context* ctx)
 {
-    const int n = gt6_spurs_spus();
-    if (n <= 5) return;
+    const int n = gt6_spurs_spus(), bgSlots = gt6_spurs_bg_slots();
+    if (n <= 5 && !bgSlots) return;
     const uint32_t attr = (uint32_t)ctx->gpr[29];
     if ((int32_t)ctx->gpr[3] != 0 || !peek_ok(attr, 0x30) || peek32(attr) != 1) return;
+    const bool bgList = peek32(attr + 0x14) == 0x0170F180u;
+    if (n <= 5 && !bgList) return;
     uint8_t* const a = vm_base + attr;
     uint8_t* const t = a + 0x18;
     uint8_t before[8];
@@ -913,13 +907,24 @@ void gt6_spurs_joblist(ppu_context* ctx)
      * of 1.1, its job module (44ed3fe39dae) ran seven times as long a frame and the pack went from 44 to 31 fps
      * (w6, w6c). So the added SPUs are not offered to it, unless GT6_SPURS_BG=1 asks for the game's own table. */
     static const bool bg = []() { const char* e = getenv("GT6_SPURS_BG"); return e && *e == '1'; }();
-    if (peek32(attr + 0x14) == 0x0170F180u && !bg) {
-        for (int i = 5; i < 8; i++) t[i] = 0;
-        if (now > 5) now = 5;
-    } else if (t[1] && t[2] && t[3] && t[4]) {
-        for (int i = 5; i < n; i++) if (!t[i]) t[i] = t[4];
-        if (t[0] && maxc == 5) now = (uint32_t)n;
-        else if (!t[0] && maxc == 4) now = (uint32_t)n - 1;
+    if (n > 5) {
+        if (bgList && !bg) {
+            for (int i = 5; i < 8; i++) t[i] = 0;
+            if (now > 5) now = 5;
+        } else if (t[1] && t[2] && t[3] && t[4]) {
+            for (int i = 5; i < n; i++) if (!t[i]) t[i] = t[4];
+            if (t[0] && maxc == 5) now = (uint32_t)n;
+            else if (!t[0] && maxc == 4) now = (uint32_t)n - 1;
+        }
+    }
+    if (bgList && bgSlots) {
+        uint8_t keep[8] = {};
+        int kept = 0;
+        for (int i = n - 1; i >= 0 && kept < bgSlots; i--)
+            if (t[i]) { keep[i] = t[i]; kept++; }
+        const uint32_t minc = peek32(attr + 0x20), want = now < (uint32_t)kept ? now : (uint32_t)kept;
+        if (kept && want && want >= minc) { memcpy(t, keep, 8); now = want; }
+        else fprintf(stderr, "[gt6-spurs] background list: %d slot(s), contention %u under its minimum %u - the game's table stays\n", kept, want, minc);
     }
     a[0x24] = (uint8_t)(now >> 24); a[0x25] = (uint8_t)(now >> 16); a[0x26] = (uint8_t)(now >> 8); a[0x27] = (uint8_t)now;
     static LONG said;
