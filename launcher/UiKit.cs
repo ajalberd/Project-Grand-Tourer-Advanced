@@ -54,7 +54,8 @@ namespace GT6Launcher
                 stack.Children.Add(sub);
             }
             foreach (UIElement element in content)
-                stack.Children.Add(element);
+                if (element != null)
+                    stack.Children.Add(element);
             return new ScrollViewer { Content = stack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
         }
 

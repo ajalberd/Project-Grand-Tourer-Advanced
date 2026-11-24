@@ -270,6 +270,7 @@ namespace GT6Launcher
             { "LanBind", "" },          // LAN NIC IPv4 bind address (GT6_LAN_BIND -> PS3_NET_BIND_IP)
             { "LanName", "" },          // LAN player name / PS3_NP_ONLINE_ID (GT6_LAN_NAME; blank = PC name)
             { "DevMenu", "0" },         // Develop Settings R1+SELECT (GT6_DEV_MENU=1; auto-enabled with LanMode)
+            { "SpursSpus", "" },        // SPURS SPU thread count override: "" = default (5), "6", "7", "8" (GT6_SPURS_SPUS)
         };
 
         public static string Default(string key)
@@ -307,6 +308,9 @@ namespace GT6Launcher
             }
             if (launcher.On("DevMenu"))
                 env["GT6_DEV_MENU"] = "1";
+            string spursSpus = launcher.Setting("SpursSpus");
+            if (spursSpus == "6" || spursSpus == "7" || spursSpus == "8")
+                env["GT6_SPURS_SPUS"] = spursSpus;
             return env;
         }
     }
@@ -319,7 +323,7 @@ namespace GT6Launcher
         public readonly Dictionary<string, string> Env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         public readonly List<string> Unset = new List<string>();
         public readonly List<KeyValuePair<string, string>> Copies = new List<KeyValuePair<string, string>>();   // the bat's log rotation
-        public bool FullHd, Overlay, Aa, FullScreen, RealRes, Ultrawide, Lan;   // what this exe knows (looked for in the exe itself)
+        public bool FullHd, Overlay, Aa, FullScreen, RealRes, Ultrawide, Lan, SpursSpus;   // what this exe knows (looked for in the exe itself)
 
         public bool Available { get { return Problem == null && Exe != null && File.Exists(Exe); } }
         public string ExeName { get { return Exe == null ? "" : Path.GetFileName(Exe); } }
@@ -400,12 +404,12 @@ namespace GT6Launcher
             try
             {
                 var file = new FileInfo(b.Exe);
-                string stamp = "5:" + file.Length + ":" + file.LastWriteTimeUtc.Ticks;   // (5: added GT6_LAN)
+                string stamp = "6:" + file.Length + ":" + file.LastWriteTimeUtc.Ticks;   // (6: added GT6_SPURS_SPUS)
                 string[] known = launcher.Value("Exe", b.ExeName, "").Split('|');
                 if (known.Length != 2 || known[0] != stamp)
                 {
-                    bool[] found = Scan(b.Exe, "MenuFullHd", "PS3_USRDIR_OVERLAY", "GT6_AA", "GT6_FULLSCREEN", "ScreenRealRes", "GT6_ASPECT", "GT6_LAN");
-                    known = new[] { stamp, (found[0] ? "F" : "") + (found[1] ? "O" : "") + (found[2] ? "A" : "") + (found[3] ? "S" : "") + (found[4] ? "R" : "") + (found[5] ? "W" : "") + (found[6] ? "L" : "") };
+                    bool[] found = Scan(b.Exe, "MenuFullHd", "PS3_USRDIR_OVERLAY", "GT6_AA", "GT6_FULLSCREEN", "ScreenRealRes", "GT6_ASPECT", "GT6_LAN", "GT6_SPURS_SPUS");
+                    known = new[] { stamp, (found[0] ? "F" : "") + (found[1] ? "O" : "") + (found[2] ? "A" : "") + (found[3] ? "S" : "") + (found[4] ? "R" : "") + (found[5] ? "W" : "") + (found[6] ? "L" : "") + (found[7] ? "P" : "") };
                     launcher.Set("Exe", b.ExeName, known[0] + "|" + known[1]);
                 }
                 b.FullHd = known[1].Contains("F");
@@ -415,6 +419,7 @@ namespace GT6Launcher
                 b.RealRes = known[1].Contains("R");   // [GT6 0102] the F2 menu's real resolution ("ScreenRealRes")
                 b.Ultrawide = known[1].Contains("W"); // GT6_ASPECT ultrawide support
                 b.Lan = known[1].Contains("L");       // GT6_LAN LAN mode + patches
+                b.SpursSpus = known[1].Contains("P"); // GT6_SPURS_SPUS SPU thread override
             }
             catch (Exception)
             {

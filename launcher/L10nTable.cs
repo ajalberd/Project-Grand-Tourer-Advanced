@@ -558,6 +558,10 @@ namespace GT6Launcher
             {"LAN 이름을 저장했습니다.", "Saved LAN player name."},
             {"개발자 설정 (R1 + SELECT)", "Develop Settings (R1 + SELECT)"},
             {"마이 홈에서 R1 + SELECT로 Develop Settings 메뉴를 엽니다. LAN 모드가 켜져 있으면 자동으로 함께 켜집니다.", "Unlocks the R1 + SELECT Develop Settings menu at My Home. Automatically enabled whenever LAN Mode is on."},
+            {"성능", "Performance"},
+            {"SPU 스레드 수 (GT6_SPURS_SPUS)", "SPU thread count (GT6_SPURS_SPUS)"},
+            {"GT6 SPURS 인스턴스에 할당할 SPU 스레드 수입니다. 기본값은 5이며, 8코어 이상 CPU에서는 6~8로 늘려 SPU 작업 여유를 확보할 수 있습니다. 게임을 시작할 때 적용됩니다.", "Number of SPU threads allocated to GT6's SPURS instance (default: 5). Raising this to 6–8 on 8+ core CPUs can give SPU-heavy scenes extra headroom. Applies when the game starts."},
+            {"5 (게임 기본)", "5 (Game default)"},
         };
     }
 }

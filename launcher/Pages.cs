@@ -157,6 +157,9 @@ namespace GT6Launcher
             chips.Children.Add(Ui.Chip("", SettingsPage.ResolutionName(fullHd, realRes), fullHd ? Ui.Brush("Accent") : Ui.Brush("SubText")));
             if (build.Lan && Launcher.On("LanMode"))
                 chips.Children.Add(Ui.Chip("", "LAN", Ui.Brush("Good")));
+            string spursChip = Launcher.Setting("SpursSpus");
+            if (build.SpursSpus && (spursChip == "6" || spursChip == "7" || spursChip == "8"))
+                chips.Children.Add(Ui.Chip("", "SPU " + spursChip, Ui.Brush("Accent2")));
             List<ModInfo> mods = ModStore.List(Launcher);
             int on = mods.Count(m => m.Enabled && m.Root != null);
             int inGame = GameMods.List(Launcher, false).Count;   // mods inside the game data itself: always applied
@@ -615,12 +618,26 @@ namespace GT6Launcher
                 Window.Toast(L.T("언어는 런처를 다시 열면 바뀝니다."));
             }, "", L.T("자동 (Windows)"), "ko", "한국어", "en", "English");
 
+            var perf = new StackPanel { IsEnabled = !running, Opacity = running ? 0.5 : 1 };
+            if (build.SpursSpus)
+            {
+                FrameworkElement spurs = Ui.Setting(L.T("SPU 스레드 수 (GT6_SPURS_SPUS)"),
+                    L.T("GT6 SPURS 인스턴스에 할당할 SPU 스레드 수입니다. 기본값은 5이며, 8코어 이상 CPU에서는 6~8로 늘려 SPU 작업 여유를 확보할 수 있습니다. 게임을 시작할 때 적용됩니다."),
+                    Ui.Choices(Launcher.Setting("SpursSpus"), delegate(string v) { Launcher.SetSetting("SpursSpus", v); },
+                        "", L.T("5 (게임 기본)"),
+                        "6", "6",
+                        "7", "7",
+                        "8", "8"));
+                perf.Children.Add(spurs);
+            }
+
             return Ui.Page(L.T("설정"), L.T("런처의 설정은 launcher.ini에, 게임 안 메뉴의 설정은 메뉴의 설정 파일에 그대로 남습니다."),
                 Ui.Card("언어 · Language",
                     Ui.Setting("언어 · Language", L.T("런처와 게임 안 메뉴(F2)의 언어입니다. 자동은 Windows의 표시 언어를 따릅니다."), language)),
                 Ui.Card(L.T("게임 빌드"),
                     Ui.Setting(L.T("플레이 버튼이 시작하는 빌드"), L.T("패키지에 든 두 실행 파일 중 하나입니다. 시험판은 자기 설정 파일을 따로 씁니다."), BuildPicker())),
                 Ui.Card(L.T("화면"), screen),
+                build.SpursSpus ? Ui.Card(L.T("성능"), perf) : null,
                 LanCard(build, running),
                 Ui.Card(L.T("소리와 입력"),
                     Toggle("Mute", L.T("소리 끄기"), L.T("게임의 소리를 내지 않습니다.")),
