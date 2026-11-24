@@ -661,10 +661,12 @@ static DWORD WINAPI frame_clock(LPVOID)
         if (fired >= 240) next_tick = now;
 
         if (rsx_ok) {
+            int did_present = 0;
             if (cellGcm_take_flip_pending()) {
                 s_last_pending_present = now;
                 present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
+                did_present = 1;
             }
             { const unsigned long long pf0 = ps3_qpc_us();
               cellGcm_rsx_process_fifo();
@@ -680,16 +682,14 @@ static DWORD WINAPI frame_clock(LPVOID)
                   ppu_lwcond_wake_all();
               } }
 
-            /* Window messages once a millisecond, not once a pass. This loop turns tens of thousands of times a
-             * second while the game kicks its command buffer in small pieces, and PeekMessage on every turn was
-             * 12.8% of this thread (win32u.dll in the sampling of run210) - the thread that limits the frame rate
-             * since the SPU job manager is lifted. GT6_PUMP_EVERY_PASS=1 = as before. */
+            /* Pump window messages once per presented frame (or every 8 ms when idle), not at 1 kHz:
+             * NtUserPeekMessage at 1 kHz was 4.3-8.4% of gt6-draw in racing profiles. GT6_PUMP_EVERY_PASS=1 = as before. */
             int pump_rc = 0;
             { static unsigned long long pump_next = 0; static int every = -1;
               if (every < 0) { const char* e = getenv("GT6_PUMP_EVERY_PASS"); every = (e && *e == '1') ? 1 : 0; }
               const unsigned long long t_us = ps3_qpc_us();
-              if (every || t_us >= pump_next) {
-                  pump_next = t_us + 1000;
+              if (every || did_present || t_us >= pump_next) {
+                  pump_next = t_us + 8000;
                   pump_rc = s_rsx_live ? rsx_null_backend_pump_messages() : rsx_d3d12_backend_pump_messages();
               } }
             if (pump_rc != 0) {

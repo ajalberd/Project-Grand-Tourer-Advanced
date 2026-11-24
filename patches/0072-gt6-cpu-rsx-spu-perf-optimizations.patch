@@ -1,0 +1,496 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 250d8d2c..5db86518 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -314,29 +314,22 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+     target_compile_options(ps3recomp_runtime PRIVATE
+         -Wall -Wextra -Wno-unused-parameter
+         -fno-strict-aliasing
+-        # No spontaneous fused multiply-add. MSVC never contracts, and x86-64
+-        # without -mfma has nothing to contract into, so every validated
+-        # result came from separate multiplies and adds; arm64 has FMA in
+-        # the base ISA and Clang fuses by default there. A PPC fmadd is
+-        # spelt as one where the lifter means one.
+-        -ffp-contract=off
+-        # Explicit, because the per-config defaults cannot be trusted: this
+-        # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
+-        # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
+-        # was unoptimised without a word. Duplicating a default -O2 is harmless.
+-        # Every configuration but Debug, including none: a port configured
+-        # without CMAKE_BUILD_TYPE matched neither name and compiled the whole
+-        # runtime -- the FIFO walker, the draw engine, the MFC -- at -O0.
+-        $<$<NOT:$<CONFIG:Debug>>:-O2>
++        $<$<BOOL:${MSVC}>:/clang:-ffp-contract=off>
++        $<$<NOT:$<BOOL:${MSVC}>>:-ffp-contract=off>
++        $<$<AND:$<NOT:$<CONFIG:Debug>>,$<BOOL:${MSVC}>>:/clang:-O3>
++        $<$<AND:$<NOT:$<CONFIG:Debug>>,$<NOT:$<BOOL:${MSVC}>>>:-O3>
+     )
+-    # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
+-    # hottest SPU op in lifted audio code. Probed rather than assumed: recent
+-    # Apple clang rejects the flag outright for arm64 ("unsupported option
+-    # '-msse4.1'"), which stops the whole runtime from building there.
++    # AVX2 + FMA + BMI2 + LZCNT + POPCNT (x86-64-v3, Haswell 2013+ / Ryzen) for hot RSX/SPU runtime paths,
++    # falling back to SSE4.1 if unsupported by the compiler target.
+     include(CheckCCompilerFlag)
+-    check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
+-    if(PS3RECOMP_HAS_MSSE41)
+-        target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
++    check_c_compiler_flag(-mavx2 PS3RECOMP_HAS_MAVX2)
++    if(PS3RECOMP_HAS_MAVX2)
++        target_compile_options(ps3recomp_runtime PRIVATE -msse4.1 -mavx2 -mfma -mbmi -mbmi2 -mlzcnt -mpopcnt)
++    else()
++        check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
++        if(PS3RECOMP_HAS_MSSE41)
++            target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
++        endif()
+     endif()
+ elseif(MSVC)
+     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 6f179871..781d12a2 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2970,8 +2970,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * short of `put` every tick is the signature of a FIFO that can never
+      * catch up, and the reason is the whole diagnosis. */
+     const char* why = "caught-up";
++    u32 cached_io_page = 0xFFFFFFFFu;
++    u32 cached_ea_page = 0;
+     while (s_fifo_getoff != put && budget-- > 0) {
+-        u32 ea = gcm_io2ea(s_fifo_getoff);
++        const u32 io_page = s_fifo_getoff >> 20;
++        u32 ea;
++        if (io_page == cached_io_page) {
++            ea = cached_ea_page + (s_fifo_getoff & 0xFFFFFu);
++        } else {
++            ea = gcm_io2ea(s_fifo_getoff);
++            if (ea) {
++                cached_io_page = io_page;
++                cached_ea_page = ea - (s_fifo_getoff & 0xFFFFFu);
++            }
++        }
+         if (!ea) {
+             /* get is sitting on an IO offset with no mapping -- the title
+              * branched into a region and then unmapped it, or the offset was
+@@ -3420,7 +3432,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
+                         rsx_fifo_burst b;
+                         b.stop = gcm_burst_stop_table();
+-                        b.max_headers = (u32)budget + 1u < 64u ? (u32)budget + 1u : 64u;    /* this header is paid for */
++                        b.max_headers = (u32)budget + 1u < 512u ? (u32)budget + 1u : 512u;   /* this header is paid for */
+                         b.trace_off = s_tr_off; b.trace_w = s_tr_w; b.trace_i = &s_tr_i; b.trace_mask = GCM_TRACE_N - 1u;
+                         b.io = s_fifo_getoff;
+                         const u32 used = g_gcm_live_fifo_burst(vm_base + ea, lim - s_fifo_getoff, &b);
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index ec148033..3b7610cc 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -45,6 +45,9 @@
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#if defined(__SSSE3__) || defined(__SSE4_1__) || defined(__AVX2__)
++#include <immintrin.h>
++#endif
+ #include "ps3emu/log_first.h"
+ 
+ #define M_DMA_COLOR1            0x018C
+@@ -637,23 +640,63 @@ u32 rsx_dispatch_fifo_burst(rsx_dispatch* rsx, const void* be, u32 max_bytes, rs
+                 } else if (k == 2) {
+                     const u32 base_slot = regs[M_VP_UPLOAD_CONST_ID >> 2];
+                     const u32 word0 = mi - (M_VP_UPLOAD_CONST >> 2);
+-                    for (u32 j = 0; j < n; j++) {
+-                        const u32 arg = rsx_run_word(d, i + j);
+-                        seen[mi + j]++;
+-                        regs[mi + j] = arg;
+-                        const u32 word = word0 + j;
+-                        const u32 slot = base_slot + (word >> 2);
+-                        if (slot < RSX_DSP_NUM_CONSTANTS)
+-                            rsx->constants[slot][word & 3u] = arg;
++                    const u32 first_slot = base_slot + (word0 >> 2);
++                    const u32 end_word = word0 + n;
++                    const u32 last_slot = base_slot + ((end_word - 1u) >> 2);
++                    /* Fast SIMD big-endian -> little-endian copy straight into rsx->constants[]
++                     * (nothing reads regs[]/seen[] for the 0x1F00..0x1F7C upload window). */
++                    if (last_slot < RSX_DSP_NUM_CONSTANTS) {
++                        u32* dst = &rsx->constants[first_slot][word0 & 3u];
++                        const u8* src = d + (size_t)i * 4u;
++                        u32 j = 0;
++#if defined(__AVX2__)
++                        const __m256i bswap32_256 = _mm256_setr_epi8(
++                            3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12,
++                            3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
++                        for (; j + 8u <= n; j += 8u) {
++                            __m256i v = _mm256_loadu_si256((const __m256i*)(src + (size_t)j * 4u));
++                            _mm256_storeu_si256((__m256i*)(dst + j), _mm256_shuffle_epi8(v, bswap32_256));
++                        }
++#endif
++#if defined(__SSSE3__)
++                        const __m128i bswap32_128 = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
++                        for (; j + 4u <= n; j += 4u) {
++                            __m128i v = _mm_loadu_si128((const __m128i*)(src + (size_t)j * 4u));
++                            _mm_storeu_si128((__m128i*)(dst + j), _mm_shuffle_epi8(v, bswap32_128));
++                        }
++#endif
++                        for (; j < n; j++) dst[j] = rsx_run_word(src, j);
++                    } else {
++                        for (u32 j = 0; j < n; j++) {
++                            const u32 arg = rsx_run_word(d, i + j);
++                            const u32 word = word0 + j;
++                            const u32 slot = base_slot + (word >> 2);
++                            if (slot < RSX_DSP_NUM_CONSTANTS)
++                                rsx->constants[slot][word & 3u] = arg;
++                        }
+                     }
+                     n_const += n;
+                 } else {
+                     u32 load = regs[M_VP_UPLOAD_FROM_ID >> 2];       /* no word of the window stores it */
+                     const u32 lane0 = mi - (M_VP_UPLOAD_INST >> 2);
+-                    for (u32 j = 0; j < n; j++) {
+-                        const u32 arg = rsx_run_word(d, i + j);
+-                        seen[mi + j]++;
+-                        regs[mi + j] = arg;
++                    const u8* src = d + (size_t)i * 4u;
++                    u32 j = 0;
++#if defined(__SSSE3__)
++                    if ((lane0 & 3u) == 0u) {
++                        const __m128i bswap32_128 = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
++                        for (; j + 4u <= n && (load + 1u) * 4u <= RSX_DSP_VP_WORDS; j += 4u, load++) {
++                            __m128i v = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(src + (size_t)j * 4u)), bswap32_128);
++                            u32* dst = vp + (size_t)load * 4u;
++                            __m128i cur = _mm_loadu_si128((const __m128i*)dst);
++                            if (_mm_movemask_epi8(_mm_cmpeq_epi32(cur, v)) != 0xFFFF) {
++                                _mm_storeu_si128((__m128i*)dst, v);
++                                vp_changed = 1;
++                            }
++                        }
++                    }
++#endif
++                    for (; j < n; j++) {
++                        const u32 arg = rsx_run_word(src, j);
+                         const u32 lane = (lane0 + j) & 3u;
+                         const u32 pos = load * 4u + lane;
+                         if (pos < RSX_DSP_VP_WORDS && vp[pos] != arg) { vp[pos] = arg; vp_changed = 1; }
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 4f20e700..e7edcb69 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -114,6 +114,9 @@ static volatile long g_ld_ps1_vram_ready = 0;
+     if (_ld_diag < 0) _ld_diag = getenv(name) != NULL; _ld_diag; })
+ #endif
+ #include <string.h>
++#if defined(__SSSE3__) || defined(__SSE4_1__) || defined(__AVX2__)
++#include <immintrin.h>
++#endif
+ 
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+@@ -272,6 +275,8 @@ typedef struct {
+     float ux, uy;             /* [GT6 0102] host pixels per guest pixel (0 or 1 = not upscaled) */
+     DXGI_FORMAT fmt;
+     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
++    u32 fb_wgen;              /* swin_wgen when fb_tex was last copied */
++    u64 fb_pass;              /* g_ld_pass_serial when fb_tex was last copied */
+     u32 pitch;                /* guest row pitch of colour target 0 (bytes), 0 = unknown */
+     u32 mx0, my0, mx1, my1;   /* LD_SURFACE_MIRROR: what draws reached since the last copy into guest memory */
+     u32 mirror_stale;         /* guest memory under this surface was rewritten from another surface */
+@@ -758,6 +763,10 @@ enum {
+     LD_SURFACE_WRITE_OTHER = 7
+ };
+ 
++static u64 g_ld_pass_serial = 1;
++static u32 g_ld_pass_target = LD_INVALID_SURFACE;
++static u32 g_ld_pass_zslot = 0;
++
+ static void ld_surface_guard_stamp(surface_t* surface);
+ static void ld_surface_note_write(u32 target, u32 kind)
+ {
+@@ -780,6 +789,10 @@ static void ld_surface_note_write(u32 target, u32 kind)
+     }
+     const u32 generation = ++g_ld_surface_generation;
+     surface->swin_wgen++;
++    if (kind != LD_SURFACE_WRITE_DRAW) {
++        surface->fb_pass = 0;
++        g_ld_pass_serial++;
++    }
+     surface->last_write_generation = generation;
+     surface->last_write_kind = kind;
+     switch (kind) {
+@@ -807,8 +820,14 @@ static void ld_surface_note_write(u32 target, u32 kind)
+     }
+ }
+ #else
++static u64 g_ld_pass_serial = 1;
++static u32 g_ld_pass_target = LD_INVALID_SURFACE;
++static u32 g_ld_pass_zslot = 0;
+ #define ld_surface_note_write(target, kind) \
+-    do { if ((target) < MAX_SURFACES) g.surfaces[(target)].swin_wgen++; } while (0)
++    do { if ((target) < MAX_SURFACES) { \
++        g.surfaces[(target)].swin_wgen++; \
++        if ((kind) != LD_SURFACE_WRITE_DRAW) { g.surfaces[(target)].fb_pass = 0; g_ld_pass_serial++; } \
++    } } while (0)
+ #endif
+ 
+ #define LD_LAYOUT_CACHE_CAP 256u
+@@ -5626,6 +5645,8 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+     if (s->fb_tex) {                 /* sized for the old resource */
+         retire_texture(s->fb_tex);
+         s->fb_tex = NULL;
++        s->fb_wgen = 0;
++        s->fb_pass = 0;
+     }
+     for (u32 j = 0; j < LD_SWIN_PER; j++)   /* windows are sized and typed for the old resource */
+         if (s->swin[j].tex) { retire_texture(s->swin[j].tex); s->swin[j].tex = NULL; s->swin[j].cube = 0; }
+@@ -5832,10 +5853,35 @@ static int surface_window_at(u32 si, const rsx_dsp_texture* t, int dbg, u32 ox,
+  * guest VRAM -- empty, so the pass painted the scene black. Snapshot the
+  * target into a per-surface copy and sample that. Returns the SRV slot, or
+  * SRV_WHITE if the copy cannot be made. */
+-static u32 surface_feedback_srv(u32 slot)
++/* LD_FEEDBACK_PER_PASS (default 1): reuse one feedback snapshot across draws
++ * in the same (target, zslot) render pass (PR #814 concept).
++ *   0 = exact swin_wgen skip only (recopy after every draw that writes the RT)
++ *   1 = share per pass for 3D / blended / multi-quad draws; keep sequential
++ *       2D unblended single-quad post-process passes exact
++ *   2 = share unconditionally for the entire (target, zslot) pass */
++static int ld_feedback_per_pass_mode(void)
++{
++    static int mode = -1;
++    if (mode < 0) {
++        const char* e = getenv("LD_FEEDBACK_PER_PASS");
++        if (!e || !e[0]) mode = 1;
++        else if (e[0] == '0') mode = 0;
++        else if (e[0] == '2') mode = 2;
++        else mode = 1;
++    }
++    return mode;
++}
++
++static u32 surface_feedback_srv_ex(u32 slot, int force, int allow_per_pass)
+ {
+     surface_t* s = &g.surfaces[slot];
+     if (!s->tex) return SRV_WHITE;
++    if (!force && s->fb_tex) {
++        if (s->fb_wgen == s->swin_wgen && s->fb_wgen != 0u)
++            return SRV_FEEDBACK_BASE + slot;
++        if (allow_per_pass && s->fb_pass == g_ld_pass_serial && g_ld_pass_serial != 0ull)
++            return SRV_FEEDBACK_BASE + slot;
++    }
+     D3D12_RESOURCE_BARRIER b[2] = {0};
+     for (int k = 0; k < 2; k++) {
+         b[k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -5871,9 +5917,16 @@ static u32 surface_feedback_srv(u32 slot)
+     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    s->fb_wgen = s->swin_wgen;
++    s->fb_pass = g_ld_pass_serial;
+     return SRV_FEEDBACK_BASE + slot;
+ }
+ 
++static u32 surface_feedback_srv(u32 slot)
++{
++    return surface_feedback_srv_ex(slot, 1, 0);
++}
++
+ /* Find the live surface whose guest rows (at `pitch`) contain byte `abs`, with
+  * room for a w x h rect there. Returns the slot and the rect's origin. */
+ static int surface_containing(u32 location, u32 abs, u32 pitch, u32 w, u32 h,
+@@ -13002,9 +13055,29 @@ static void ld_vs_write_indices(const ld_vs_draw* d, u32 prim, u32* out)
+     const u32 bias = d->bias, total = d->total;
+     u32 w = 0;
+     switch (prim) {
+-    case PRIM_TRIANGLES:
+-        for (u32 i = 0; i < d->n_index; i++) out[i] = raw[i] + bias;
++    case PRIM_TRIANGLES: {
++        const u32 n = d->n_index;
++        if (!bias) {
++            memcpy(out, raw, (size_t)n * sizeof(u32));
++        } else {
++            u32 i = 0;
++#if defined(__AVX2__)
++            const __m256i vb = _mm256_set1_epi32((int)bias);
++            for (; i + 8u <= n; i += 8u) {
++                __m256i v = _mm256_loadu_si256((const __m256i*)(raw + i));
++                _mm256_storeu_si256((__m256i*)(out + i), _mm256_add_epi32(v, vb));
++            }
++#elif defined(__SSE2__)
++            const __m128i vb = _mm_set1_epi32((int)bias);
++            for (; i + 4u <= n; i += 4u) {
++                __m128i v = _mm_loadu_si128((const __m128i*)(raw + i));
++                _mm_storeu_si128((__m128i*)(out + i), _mm_add_epi32(v, vb));
++            }
++#endif
++            for (; i < n; i++) out[i] = raw[i] + bias;
++        }
+         break;
++    }
+     case PRIM_TRIANGLE_STRIP:
+         for (u32 i = 0; i + 2u < total; i++) {
+             out[w++] = raw[i + (i & 1u)] + bias;
+@@ -13022,12 +13095,14 @@ static void ld_vs_write_indices(const ld_vs_draw* d, u32 prim, u32* out)
+     case PRIM_QUADS:
+         for (u32 q = 0; q < total / 4u; q++) {
+             const u32 b = q * 4u;
+-            out[w++] = raw[b] + bias;
+-            out[w++] = raw[b + 1u] + bias;
+-            out[w++] = raw[b + 2u] + bias;
+-            out[w++] = raw[b + 2u] + bias;
+-            out[w++] = raw[b + 3u] + bias;
+-            out[w++] = raw[b] + bias;
++            const u32 i0 = raw[b] + bias, i1 = raw[b + 1u] + bias;
++            const u32 i2 = raw[b + 2u] + bias, i3 = raw[b + 3u] + bias;
++            out[w++] = i0;
++            out[w++] = i1;
++            out[w++] = i2;
++            out[w++] = i2;
++            out[w++] = i3;
++            out[w++] = i0;
+         }
+         break;
+     }
+@@ -14893,17 +14968,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 vertex_pull = 0; g_vpull.bounds++;
+             }
+             if (vertex_pull) {
+-                /* Freeze at the ordinary fetch point, before a cold PSO
+-                 * compile can let the guest overwrite its source arrays.
+-                 * The later memcpy stages these immutable bytes into the
+-                 * fenced UPLOAD ring; no float expansion takes place. */
+-                rsx_vertex_pull_snapshot(&pull_plan, dc.compact_verts);
+-                /* Compile failure must retain the established CPU draw, not
+-                 * introduce a dropped group. No draw/upload side effects yet. */
++                /* Resolve the pull PSO first so async-pending draws skip without
++                 * copying guest memory, and warm hits snapshot directly into the
++                 * D3D12 UPLOAD ring below (eliminating the dc.compact_verts double-copy). */
+                 pull_pso = get_pso(&used_layout, 1, 1);
+                 if (!pull_pso && g_ld_ap_last_pending) {
+-                    /* being made (LD_ASYNC_PSO): leave the draw out now, before the CPU path fetches its
+-                     * vertices and asks for a second pipeline that would only be thrown away */
+                     live_draw_csv_emit(prim, 0, "wait_pso");
+                     g_ld_ap.skipped_draws++;
+                     return;
+@@ -15033,7 +15102,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g.srv_ring_used = 0;
+         g.smp_ring_used = 0;
+     }
+-    if (draw_vb_bytes)
++    if (vertex_pull)
++        rsx_vertex_pull_snapshot(&pull_plan, g.vb_mapped + g.vb_used);
++    else if (draw_vb_bytes)
+         memcpy(
+             g.vb_mapped + g.vb_used, vertex_data,
+             (size_t)draw_vb_bytes);
+@@ -15393,6 +15464,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+               }
+           }
+       } }
++    if (target != g_ld_pass_target || current_zslot != g_ld_pass_zslot) {
++        g_ld_pass_target = target;
++        g_ld_pass_zslot = current_zslot;
++        g_ld_pass_serial++;
++    }
+     g_ld_fb_bound_n = 0;
+     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) {
+         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+@@ -15604,7 +15680,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             static int fbw = -1;
+             if (fbw < 0) { const char* e = getenv("LD_FEEDBACK_WINDOW"); fbw = (e && *e == '0') ? 0 : 1; }
+             const int fw = fbw ? surface_window(target, &t, LD_DIAG_ENABLED("LD_ALIAS_DBG")) : -1;
+-            slots[u] = fw >= 0 ? (u32)fw : surface_feedback_srv(target);
++            const int fb_mode = ld_feedback_per_pass_mode();
++            const int fb_allow_pass = fb_mode == 2 ||
++                (fb_mode == 1 && ((rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0u ||
++                                  (rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u) != 0u ||
++                                  n_tri > 6u));
++            slots[u] = fw >= 0 ? (u32)fw : surface_feedback_srv_ex(target, 0, fb_allow_pass);
+             g_ld_bind_surf++;
+             if (g_ld_fb_bound_n < 4) {
+                 g_ld_fb_bound[g_ld_fb_bound_n].si = target;
+@@ -17975,6 +18056,9 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
+ void rsx_live_draw_present(u32 buffer_id)
+ {
+     if (!g.ready) return;
++    g_ld_pass_serial++;
++    g_ld_pass_target = LD_INVALID_SURFACE;
++    g_ld_pass_zslot = 0;
+ 
+     /* LD_SURF_DUMP=<dir>: dump EVERY live surface once, with its non-black
+      * count, at LD_SURF_DUMP_FRAME (default 1200).
+@@ -17984,9 +18068,14 @@ void rsx_live_draw_present(u32 buffer_id)
+      * pixels stop. ps1_netemu composites PS1 VRAM into a 720x512 surface and
+      * then upscales into the presented 1280x720 one, so the interesting
+      * question is which of those is already empty. */
+-    { static int done = 0; const char* sd = getenv("LD_SURF_DUMP");
+-      u32 at = 1200; { const char* fe = getenv("LD_SURF_DUMP_FRAME");
+-                       if (fe) at = (u32)strtoul(fe, 0, 0); }
++    { static int done = 0;
++      static const char* sd = (const char*)-1;
++      static u32 at = 1200;
++      if (sd == (const char*)-1) {
++          sd = getenv("LD_SURF_DUMP");
++          const char* fe = getenv("LD_SURF_DUMP_FRAME");
++          if (fe) at = (u32)strtoul(fe, 0, 0);
++      }
+       /* LD_SURF_DUMP_ON_VRAM=1 waits for PS1 VRAM to hold a drawn frame instead
+        * of firing at a frame number. Needs PS1_PC=1, which is what samples it. */
+       int gate;
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 91b1c8ae..1faf9a0c 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1298,7 +1298,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+  * RdInMbox must PARK, not fabricate a zero -- there is no scheduler above it to
+  * retry. Off unless a raw SPU is actually created, so no other port changes. */
+ int g_spu_force_ch_block = 0;
+-int g_spu_ch_spin_us = 0;        /* see spu_ch_wait */
++int g_spu_ch_spin_us = -1;       /* see spu_ch_wait: -1 = read SPU_CH_SPIN_US (default 80 us) */
+ 
+ static int yz_ch_block(void)
+ {
+@@ -1402,6 +1402,11 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+      * thread parks about 2,000 times a second and stays parked 0.1 ms on average (run236): most of the time what
+      * it waits for is already on its way, and a park costs a system call here, one in whoever wakes it and the
+      * scheduler's delay in between. 0 (the default) = park at once. */
++    if (g_spu_ch_spin_us < 0) {
++        const char* e = getenv("SPU_CH_SPIN_US");
++        int v = (e && *e) ? atoi(e) : 80;
++        g_spu_ch_spin_us = v < 0 ? 0 : v > 5000 ? 5000 : v;
++    }
+     if (g_spu_ch_spin_us > 0) {
+ #ifdef _WIN32
+         static LARGE_INTEGER f;
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 06bdc6b5..3a8075f1 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -647,11 +647,17 @@ static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t
+     g_spu_ls_rdiag = g_spu_ls_probe || spu_ls_wws_probe_on() || g_spu_ls_watch_n != 0;
+ }
+ 
++#ifndef SPU_LS_PROBES
++#define SPU_LS_PROBES 1
++#endif
++
+ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+ {
+     u128 v;
++#if SPU_LS_PROBES
+     if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
+         spu_ls_read_diag(ctx, lsa);
++#endif
+     lsa &= SPU_LS_MASK & ~0xFu;
+     const uint8_t* p = &ctx->ls[lsa];
+ #if defined(__ARM_NEON)
+@@ -768,8 +774,12 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+     }
+ #endif
+     spu_ls_code_store_check(ctx, lsa, 16);
++#if SPU_LS_PROBES
+     if (__builtin_expect(g_spu_ls_wdiag != 0, 0))
+         spu_ls_write_diag(ctx, lsa, val);
++#else
++    (void)val;
++#endif
+ }
+ 
+ /* ---------------------------------------------------------------------------

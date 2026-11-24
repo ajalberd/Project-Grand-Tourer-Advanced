@@ -1,0 +1,147 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 9d496136..4f20e700 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -10151,11 +10151,8 @@ static ID3D12PipelineState* get_pso(
+         key = fnv1a(shadow, sizeof(shadow), key);
+     }
+     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+-    /* BRB/CLB outcomes are baked into the program (rsx_vp_set_branch_bits). */
+-    const int vp_branch_bits_used = vm->branch_bits;   /* = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16) */
+-    const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
+-    if (vp_branch_bits_used)
+-        key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
++    /* BRB/CLB read SET_TRANSFORM_BRANCH_BITS dynamically via asuint(vp_posoffset.w)
++     * (PR #757), so branch bits no longer fragment the PSO cache. */
+     if (point_draw) {
+         const u32 point_tag = 0x31545053u;   /* SPT1: topology and geometry stage */
+         key = fnv1a(&point_tag, sizeof(point_tag), key);
+@@ -10324,7 +10321,6 @@ static ID3D12PipelineState* get_pso(
+     const LONGLONG decompile_begin = ld_profile_qpc();
+ #endif
+     rsx_vp_set_branch_base(rsx_dsp_vp_start(&g.rsx));
+-    rsx_vp_set_branch_bits(vp_branch_bits);
+     const int vi = vertex_pull
+         ? rsx_vp_decompile_pull_ex(
+             vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
+@@ -15959,6 +15955,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
+         xf[6] = vp.translate[2];
+     }
++    rsx_vp_set_epilogue_branch_bits(xf, rsx_dsp_reg(&g.rsx, 0x1FF8u));
+     u8* cbdst = g.cb_mapped + g.cb_used;
+     /* Upload only the constants this draw's vertex program can read (its
+      * range from get_pso; all 512 when it indexes them by address register).
+diff --git a/libs/video/rsx_texture_layout.c b/libs/video/rsx_texture_layout.c
+index 51a30a23..31731562 100644
+--- a/libs/video/rsx_texture_layout.c
++++ b/libs/video/rsx_texture_layout.c
+@@ -368,13 +368,15 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
+      * reads its DEPTH16 shadow maps through crossbar 0xA900, R, G and B from A,
+      * which through lanes_argb was the resource's opaque alpha -- every
+      * shadow compare saw depth 1.0. */
+-    static const u8 lanes_argb[4]  = {3, 0, 1, 2};
+-    static const u8 lanes_g8b8[4]  = {1, 0, 1, 0};
+-    static const u8 lanes_b8[4]    = {RSX_REMAP_ONE, 0, 0, 0};
+-    static const u8 lanes_depth[4] = {0, 0, 0, 0};
++    static const u8 lanes_argb[4]    = {3, 0, 1, 2};
++    static const u8 lanes_g8b8[4]    = {1, 0, 1, 0};
++    static const u8 lanes_b8[4]      = {RSX_REMAP_ONE, 0, 0, 0};
++    static const u8 lanes_depth[4]   = {0, 0, 0, 0};
++    static const u8 lanes_y16x16f[4] = {0, 1, 0, 1};
+     const u32 base = rsx_fmt & 0x9Fu;
+     const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
+                       : (base == 0x81u || base == 0x94u) ? lanes_b8
++                      : (base == 0x9Fu) ? lanes_y16x16f
+                       : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
+ 
+     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
+diff --git a/libs/video/rsx_vertex_fetch.c b/libs/video/rsx_vertex_fetch.c
+index bd31518d..730644c1 100644
+--- a/libs/video/rsx_vertex_fetch.c
++++ b/libs/video/rsx_vertex_fetch.c
+@@ -110,6 +110,7 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
+             out[1] = (float)y / 1023.0f;
+             out[2] = (float)z / 511.0f;
+             out[3] = 1.0f;
++            n = 4;
+         }
+         break;
+     case 7: /* UB256: u8 unnormalized */
+diff --git a/libs/video/rsx_vp_decompiler.c b/libs/video/rsx_vp_decompiler.c
+index 801dff82..604f1fc3 100644
+--- a/libs/video/rsx_vp_decompiler.c
++++ b/libs/video/rsx_vp_decompiler.c
+@@ -140,8 +140,7 @@ static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
+ static u32 s_vp_branch_base = 0;   /* VP slot the program being decompiled starts at */
+ void rsx_vp_set_branch_base(u32 start_slot) { s_vp_branch_base = start_slot; }
+ 
+-static u32 s_vp_branch_bits = 0;   /* SET_TRANSFORM_BRANCH_BITS, tested by BRB/CLB */
+-void rsx_vp_set_branch_bits(u32 bits) { s_vp_branch_bits = bits; }
++void rsx_vp_set_branch_bits(u32 bits) { (void)bits; }
+ 
+ int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes)
+ {
+@@ -530,17 +529,19 @@ static int rsx_vp_decompile_impl(
+             else {                                         /* BRB, CLB */
+                 /* A boolean branch tests bit D3[23:27] of the transform
+                  * branch bits against D3[28] and ignores the CC condition
+-                 * (RPCS3's GetOptionalBranchCond). The bits are baked in:
+-                 * the caller keys the program on them. */
+-                const u32 bit = (s_vp_branch_bits >> ((d3 >> 23) & 0x1Fu)) & 1u;
+-                const int taken = bit == ((d3 >> 28) & 1u);
+-                if (!taken)
+-                    snprintf(flow_term, sizeof flow_term, "        _pc = %d;\n", next);
+-                else if (sca_op == 0x11)
+-                    snprintf(flow_term, sizeof flow_term, "        _pc = %u;\n", tgt);
++                 * (RPCS3's GetOptionalBranchCond). Read at runtime from
++                 * asuint(vp_posoffset.w) (PR #757) so branch-bit changes do
++                 * not spawn separate PSOs. */
++                const u32 bbit = (d3 >> 23) & 0x1Fu;
++                const u32 want = (d3 >> 28) & 1u;
++                char bc[80];
++                snprintf(bc, sizeof bc, "((asuint(vp_posoffset.w) >> %uu) & 1u) == %uu", bbit, want);
++                if (sca_op == 0x11)
++                    snprintf(flow_term, sizeof flow_term, "        _pc = (%s) ? %u : %d;\n", bc, tgt, next);
+                 else
+                     snprintf(flow_term, sizeof flow_term,
+-                             "        _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u;\n", next, tgt);
++                             "        if (%s) { _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %d;\n",
++                             bc, next, tgt, next);
+             }
+         }
+         /* ---- scalar ALU (reads SRC2) ---- */
+diff --git a/libs/video/rsx_vp_decompiler.h b/libs/video/rsx_vp_decompiler.h
+index ad39e80d..e5676b65 100644
+--- a/libs/video/rsx_vp_decompiler.h
++++ b/libs/video/rsx_vp_decompiler.h
+@@ -16,6 +16,7 @@
+ #define PS3RECOMP_RSX_VP_DECOMPILER_H
+ 
+ #include "ps3emu/ps3types.h"
++#include <string.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -57,12 +58,18 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
+  * to the ucode pointer handed in. Defaults to 0. */
+ void rsx_vp_set_branch_base(u32 start_slot);
+ 
+-/* SET_TRANSFORM_BRANCH_BITS for the next program decompiled. BRB and CLB
+- * branch on one of these bits; the decompiler bakes the outcome in, so a
+- * program that rsx_vp_uses_branch_bits() must be keyed on them too. */
++/* SET_TRANSFORM_BRANCH_BITS: BRB and CLB read bits dynamically from
++ * asuint(vp_posoffset.w) (epilogue[7]), filled per draw via
++ * rsx_vp_set_epilogue_branch_bits(). rsx_vp_set_branch_bits() is kept as a
++ * compatibility no-op. */
+ void rsx_vp_set_branch_bits(u32 bits);
+ int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes);
+ 
++static inline void rsx_vp_set_epilogue_branch_bits(float epilogue[8], u32 bits)
++{
++    memcpy(&epilogue[7], &bits, sizeof(bits));
++}
++
+ /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
+  * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).
+  * Unmasked units retain the defined-zero fallback. */

@@ -272,7 +272,8 @@ if(SPU_SOURCES)
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         # SPU_CALL_FAST_PATH (2026-11-18): the call bracket's ordinary outcome inline (spu_context.h, [GT6 0053]).
-        COMPILE_DEFINITIONS "SPU_USE_DISPATCH_MT;SPU_CALL_FAST_PATH")
+        # SPU_LS_PROBES=0 (PR #841): compile diagnostic LS read/write probe checks out of lifted SPU code.
+        COMPILE_DEFINITIONS "SPU_USE_DISPATCH_MT;SPU_CALL_FAST_PATH;SPU_LS_PROBES=0")
     # GT6_SPU_SIMD (AVX2 | SSE41 | OFF): the instruction set the lifted SPU code is compiled for.
     # runtime/spu/spu_helpers.h has SSE4.1 forms of the hot SPU ops (shufb, rotqby, selb, ...) and AVX2 forms of
     # the per-lane variable shifts, each chosen by __SSE4_1__ / __AVX2__ at compile time and bit-identical to the
@@ -286,7 +287,7 @@ if(SPU_SOURCES)
     # and need FMA3 for the fused multiply-add (every AVX2 CPU of Intel and AMD has it). -ffp-contract=off stays,
     # so the compiler itself never fuses anything.
     if(GT6_SPU_SIMD STREQUAL "AVX2")
-        list(APPEND _gt6_spu_opts -msse4.1 -mavx2 -mfma)
+        list(APPEND _gt6_spu_opts -msse4.1 -mavx2 -mfma -mbmi -mbmi2 -mlzcnt -mpopcnt)
     elseif(GT6_SPU_SIMD STREQUAL "SSE41")
         list(APPEND _gt6_spu_opts -msse4.1)
     endif()
