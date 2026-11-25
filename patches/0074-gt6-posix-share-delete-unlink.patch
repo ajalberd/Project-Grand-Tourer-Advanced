@@ -1,0 +1,61 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index c4060764..93f9a79f 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -377,7 +377,32 @@ static void cellFsOpen(ppu_context* ctx)
+             return;
+         }
+     }
++#ifdef _WIN32
++    /* Open with FILE_SHARE_DELETE so PS3/POSIX cellFsUnlink() on an open file
++     * (e.g. GT6 PDIPFS .fdupm/.fdupi track installs) succeeds instead of
++     * failing with ERROR_SHARING_VIOLATION (CELL_FS_EBUSY). */
++    int hfd = -1;
++    {
++        DWORD desired = (acc == CELL_FS_O_RDWR)   ? (GENERIC_READ | GENERIC_WRITE)
++                      : (acc == CELL_FS_O_WRONLY) ? GENERIC_WRITE : GENERIC_READ;
++        DWORD disp = (flags & CELL_FS_O_CREAT)
++                     ? ((flags & CELL_FS_O_EXCL)  ? CREATE_NEW
++                      : (flags & CELL_FS_O_TRUNC) ? CREATE_ALWAYS : OPEN_ALWAYS)
++                     : ((flags & CELL_FS_O_TRUNC) && acc != CELL_FS_O_RDONLY
++                        ? TRUNCATE_EXISTING : OPEN_EXISTING);
++        HANDLE wh = CreateFileA(hpath, desired,
++                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                                NULL, disp, FILE_ATTRIBUTE_NORMAL, NULL);
++        if (wh != INVALID_HANDLE_VALUE) {
++            int osf_flags = _O_BINARY | ((acc == CELL_FS_O_RDONLY) ? _O_RDONLY : 0)
++                          | ((flags & CELL_FS_O_APPEND) ? _O_APPEND : 0);
++            hfd = _open_osfhandle((intptr_t)wh, osf_flags);
++            if (hfd < 0) CloseHandle(wh);
++        }
++    }
++#else
+     int hfd = open(hpath, oflags | O_BINARY, 0666);
++#endif
+     if (hfd < 0) {
+         fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+@@ -1212,7 +1237,22 @@ static void cellFsUnlink(ppu_context* ctx)
+     else if (attr & FILE_ATTRIBUTE_DIRECTORY) err = CELL_FS_EISDIR;
+     else {
+         if (attr & FILE_ATTRIBUTE_READONLY) SetFileAttributesA(hpath, attr & ~FILE_ATTRIBUTE_READONLY);
+-        if (!DeleteFileA(hpath)) {
++        /* Try POSIX unlink first (Win10 1709+): immediately removes the name
++         * from the directory even while open FILE_SHARE_DELETE handles exist,
++         * preventing STATUS_DELETE_PENDING if the game recreates the file. */
++        BOOL removed = FALSE;
++        {
++            HANDLE uh = CreateFileA(hpath, DELETE,
++                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                                    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
++            if (uh != INVALID_HANDLE_VALUE) {
++                struct { DWORD Flags; } fdi = { 0x1u /* DELETE */ | 0x2u /* POSIX_SEMANTICS */ };
++                removed = SetFileInformationByHandle(uh, (FILE_INFO_BY_HANDLE_CLASS)21 /* FileDispositionInfoEx */,
++                                                     &fdi, sizeof(fdi));
++                CloseHandle(uh);
++            }
++        }
++        if (!removed && !DeleteFileA(hpath)) {
+             const DWORD e = GetLastError();
+             err = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? CELL_FS_ENOENT
+                 : (e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) ? CELL_FS_EBUSY : CELL_FS_EIO;

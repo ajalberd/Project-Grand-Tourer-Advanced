@@ -1,0 +1,132 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index f52889f7..fde73893 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -65,6 +65,7 @@ void rsx_live_draw_set_present_nowait(int on) { (void)on; }
+ int rsx_live_draw_present_stretch = 0;
+ float rsx_live_draw_present_gamma = 1.0f;
+ float rsx_live_draw_present_aspect = 0.0f;
++int rsx_live_draw_present_max_fps = 0;
+ void rsx_live_draw_upscale(float ux, float uy) { (void)ux; (void)uy; }
+ void rsx_live_draw_upscale_size(u32 w, u32 h) { (void)w; (void)h; }
+ double rsx_live_draw_get_present_fps(void) { return 0.0; }
+@@ -16689,25 +16690,51 @@ static int make_depth_snapshot_pipeline(void)
+  * (sy2 vs fm2, a match: seconds under 58 fps 27 vs 13). Other rates keep 1. LD_SYNC_INTERVAL=<1-4> forces a value.
+  * Looked up again every 5 s, in case the window moves to another monitor. */
+ static HWND s_ld_hwnd;
+-/* Optional host-side pacing for render-interval experiments. This does not
+- * change guest clocks, physics, input-repeat intervals, or audio rate. The
+- * explicit setting bypasses DXGI vsync and limits completed presents to at
+- * most 120 Hz; an ordinary launch retains the existing presentation policy. */
+-static UINT ld_present_max_fps(void)
+-{
+-    static int value = -1;
+-    if (value < 0) {
+-        const char* e = getenv("LD_PRESENT_MAX_FPS");
+-        int requested = e ? atoi(e) : 0;
+-        value = requested >= 30 ? (requested > 120 ? 120 : requested) : 0;
+-        if (value) fprintf(stderr, "[live-draw] host present limit=%d Hz (guest clock unchanged)\n", value);
++/* Live host-side present limit: 0 = stock DXGI vsync, -1 = unlimited (no pace,
++ * sync interval 0 + ALLOW_TEARING), 30..1000 = paced Hz (sync interval 0 +
++ * ALLOW_TEARING). Can be changed live from the F2 menu or set via
++ * LD_PRESENT_MAX_FPS (number, "-1", "unlimited", or "off"). */
++int rsx_live_draw_present_max_fps = 0;
++static int g_ld_allow_tearing = 0;
++static int ld_present_max_fps(void)
++{
++    static int env_checked = 0;
++    static int last_logged = -999;
++    if (!env_checked) {
++        env_checked = 1;
++        if (rsx_live_draw_present_max_fps == 0) {
++            const char* e = getenv("LD_PRESENT_MAX_FPS");
++            if (e && *e) {
++                if (_stricmp(e, "unlimited") == 0 || _stricmp(e, "off") == 0 || atoi(e) < 0)
++                    rsx_live_draw_present_max_fps = -1;
++                else {
++                    const int requested = atoi(e);
++                    rsx_live_draw_present_max_fps = requested >= 30 ? (requested > 1000 ? 1000 : requested) : 0;
++                }
++            }
++        }
+     }
+-    return (UINT)value;
++    int v = rsx_live_draw_present_max_fps;
++    if (v < 0) v = -1;
++    else if (v > 0 && v < 30) v = 0;
++    else if (v > 1000) v = 1000;
++    if (v != last_logged) {
++        if (last_logged != -999 || v != 0) {
++            if (v < 0) fprintf(stderr, "[live-draw] host present limit=unlimited (sync=0%s, guest clock unchanged)\n",
++                               g_ld_allow_tearing ? " + tearing" : "");
++            else if (v > 0) fprintf(stderr, "[live-draw] host present limit=%d Hz (sync=0%s, guest clock unchanged)\n",
++                                    v, g_ld_allow_tearing ? " + tearing" : "");
++            else fprintf(stderr, "[live-draw] host present limit=stock vsync\n");
++        }
++        g_ld_present_deadline = 0;
++        last_logged = v;
++    }
++    return v;
+ }
+ static void ld_present_pace(void)
+ {
+-    const UINT fps = ld_present_max_fps();
+-    if (!fps || g_ld_qpc_frequency <= 0) return;
++    const int fps = ld_present_max_fps();
++    if (fps <= 0 || g_ld_qpc_frequency <= 0) return;
+     LARGE_INTEGER now;
+     QueryPerformanceCounter(&now);
+     const LONGLONG period = (g_ld_qpc_frequency + (LONGLONG)fps / 2) / (LONGLONG)fps;
+@@ -16735,7 +16762,7 @@ static void ld_present_pace(void)
+ }
+ static UINT ld_sync_interval(void)
+ {
+-    if (ld_present_max_fps()) return 0;
++    if (ld_present_max_fps() != 0) return 0;
+     static UINT cached = 0;
+     static ULONGLONG next = 0;
+     const ULONGLONG now = GetTickCount64();
+@@ -16808,7 +16835,7 @@ static void ld_backbuffer_follow(void)
+     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++)
+         if (g.backbuf[i]) { g.backbuf[i]->lpVtbl->Release(g.backbuf[i]); g.backbuf[i] = NULL; }
+     const HRESULT hr = g.swap->lpVtbl->ResizeBuffers(g.swap, LD_SWAP_BUFFERS, (UINT)cw, (UINT)ch,
+-        DXGI_FORMAT_R8G8B8A8_UNORM, 0);
++        DXGI_FORMAT_R8G8B8A8_UNORM, g_ld_allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
+     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {
+         g.swap->lpVtbl->GetBuffer(g.swap, i, &IID_ID3D12Resource, (void**)&g.backbuf[i]);
+         if (g.backbuf[i]) g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.backbuf[i], NULL, rtv_handle(i));
+@@ -17020,10 +17047,23 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     g.fence_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+ 
+     /* swap chain bound to the runtime's HWND */
++    g_ld_allow_tearing = 0;
++    { const char* e = getenv("LD_ALLOW_TEARING");
++      if (!(e && *e == '0')) {
++          IDXGIFactory5* f5 = NULL;
++          if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, &IID_IDXGIFactory5, (void**)&f5))) {
++              BOOL allow = FALSE;
++              if (SUCCEEDED(f5->lpVtbl->CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof(allow))) && allow)
++                  g_ld_allow_tearing = 1;
++              f5->lpVtbl->Release(f5);
++          }
++      }
++      fprintf(stderr, "[live-draw] swap chain tearing: %s\n", g_ld_allow_tearing ? "on" : "off"); }
+     DXGI_SWAP_CHAIN_DESC1 scd = {0};
+     scd.Width = width; scd.Height = height; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+     scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+     scd.BufferCount = LD_SWAP_BUFFERS; scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++    scd.Flags = g_ld_allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
+     IDXGISwapChain1* sc1 = NULL;
+     if (FAILED(factory->lpVtbl->CreateSwapChainForHwnd(factory, (IUnknown*)g.queue,
+             (HWND)hwnd, &scd, NULL, NULL, &sc1))) {
+@@ -18494,7 +18534,9 @@ void rsx_live_draw_present(u32 buffer_id)
+         if (!hold) {
+             last_show = show_t;
+             ld_present_pace();
+-            present_hr = g.swap->lpVtbl->Present(g.swap, nowait ? 0 : ld_sync_interval(), 0);
++            const UINT sync = nowait ? 0u : ld_sync_interval();
++            const UINT pflags = (sync == 0u && g_ld_allow_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
++            present_hr = g.swap->lpVtbl->Present(g.swap, sync, pflags);
+         }
+         if (!hold && SUCCEEDED(present_hr))
+             ld_present_measure_record(g_ld_frames + 1u);

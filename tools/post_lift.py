@@ -48,9 +48,23 @@ audio_fifo_done = 0
 FRAME_WAIT_CALL = CALL.format(0x008A8A48, 'func_008A7D5C')
 FRAME_WAIT_HOOK = ('        ctx->lr = 0x008A8A48; gt6_render_wait_target(ctx); '
                    'func_008A7D5C(ctx); DRAIN_TRAMPOLINE(ctx); /*GT6_RENDER_WAIT*/\n')
+FLIP_TARGET_OLD = (
+    '        ctx->gpr[0] = (uint64_t)((int64_t)(int32_t)ctx->gpr[28] * (int64_t)(int32_t)ctx->gpr[0]);\n'
+    '        ctx->gpr[0] = (int64_t)(int32_t)ctx->gpr[0];\n'
+    '        ctx->gpr[0] = ctx->gpr[27] + ctx->gpr[0];\n'
+    '        vm_write64(ctx->gpr[29] + 0x10, ctx->gpr[0]);\n'
+)
+FLIP_TARGET_NEW = (
+    '        ctx->gpr[0] = (uint64_t)((int64_t)(int32_t)ctx->gpr[28] * (int64_t)(int32_t)ctx->gpr[0]);\n'
+    '        ctx->gpr[0] = (int64_t)(int32_t)ctx->gpr[0];\n'
+    '        ctx->gpr[0] = ctx->gpr[27] + ctx->gpr[0];\n'
+    '        { extern void gt6_flip_target_vblank(ppu_context*); gt6_flip_target_vblank(ctx); } /*GT6_FLIP_TARGET*/\n'
+    '        vm_write64(ctx->gpr[29] + 0x10, ctx->gpr[0]);\n'
+)
 FRAME_TIME_HEAD = 'void func_001F90FC(ppu_context* ctx) {\n'
 FRAME_TIME_HOOK = '    gt6_frame_timing_observe(ctx); /*GT6_FRAME_TIMING*/\n'
 frame_wait_done = 0
+flip_target_done = 0
 frame_time_done = 0
 movie_post_done = 0
 movie_clock_done = 0
@@ -132,19 +146,26 @@ def apply_movie_post(text):
 def apply_frame_timing(text):
     """One logical wait call has two overlapping lifted entry bodies."""
     wait_count = text.count(FRAME_WAIT_HOOK)
+    flip_count = text.count(FLIP_TARGET_NEW)
     time_count = text.count(FRAME_TIME_HEAD + FRAME_TIME_HOOK)
     if text.count('/*GT6_RENDER_WAIT*/') != wait_count:
         raise ValueError('moved or partial render wait hook')
+    if text.count('/*GT6_FLIP_TARGET*/') != flip_count:
+        raise ValueError('moved or partial flip target hook')
     if text.count('/*GT6_FRAME_TIMING*/') != time_count:
         raise ValueError('moved or partial frame timing hook')
     wait_original = text.count(FRAME_WAIT_CALL)
     if wait_count and wait_original:
         raise ValueError('partially patched render wait')
+    flip_original = text.count(FLIP_TARGET_OLD)
+    if flip_count and flip_original:
+        raise ValueError('partially patched flip target')
     text = text.replace(FRAME_WAIT_CALL, FRAME_WAIT_HOOK)
+    text = text.replace(FLIP_TARGET_OLD, FLIP_TARGET_NEW)
     if not time_count:
         time_count = text.count(FRAME_TIME_HEAD)
         text = text.replace(FRAME_TIME_HEAD, FRAME_TIME_HEAD + FRAME_TIME_HOOK)
-    return text, wait_count + wait_original, time_count
+    return text, wait_count + wait_original, flip_count + flip_original, time_count
 
 
 def apply_audio_fifo(text):
@@ -322,8 +343,9 @@ for p in sorted(glob.glob(os.path.join(d, 'ppu_recomp_*.cpp'))):
         aspect_done += 1
     t, audio_fifo_count = apply_audio_fifo(t)
     audio_fifo_done += audio_fifo_count
-    t, frame_wait_count, frame_time_count = apply_frame_timing(t)
+    t, frame_wait_count, flip_target_count, frame_time_count = apply_frame_timing(t)
     frame_wait_done += frame_wait_count
+    flip_target_done += flip_target_count
     frame_time_done += frame_time_count
     t, movie_post_count = apply_movie_post(t)
     movie_post_done += movie_post_count
@@ -376,9 +398,9 @@ if aspect_done != 1:
     raise SystemExit(f'GT6_ASPECT: expected exactly one aspect getter hook, found {aspect_done}')
 if audio_fifo_done != 2:
     raise SystemExit(f'GT6_AUDIO_FIFO: expected exactly one begin/end pair, found {audio_fifo_done}')
-if frame_wait_done != 2 or frame_time_done != 1:
-    raise SystemExit(f'GT6_FRAME_TIMING: expected two wait copies and one time hook, '
-                     f'found {frame_wait_done} / {frame_time_done}')
+if frame_wait_done != 2 or flip_target_done != 1 or frame_time_done != 1:
+    raise SystemExit(f'GT6_FRAME_TIMING: expected two wait copies, one flip target and one time hook, '
+                     f'found {frame_wait_done} / {flip_target_done} / {frame_time_done}')
 if movie_post_done != 2:
     raise SystemExit(f'GT6_MOVIE_POST: expected one begin/end pair, found {movie_post_done}')
 if movie_clock_done != 4:

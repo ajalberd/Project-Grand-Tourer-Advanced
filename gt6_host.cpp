@@ -824,11 +824,27 @@ extern "C" int gt6_watch_trap(EXCEPTION_POINTERS* ep, uint32_t guest_addr)
  * GT6_PATCHES=list prints what there is. Data-only patches are written into guest memory here, once.
  * -------------------------------------------------------------------------*/
 #include "gt6_patches.inc"
+extern "C" volatile int g_gt6_unlock_fps;
 static void gt6_patches_init(void)
 {
     const char* list = getenv("GT6_PATCHES");
     for (const auto& p : k_gt6_patches) {
         const char* e = getenv(p.env);
+        if (p.guard == &g_gt6p_unlock_fps) {
+            if (e && _stricmp(e, "legacy") == 0) {
+                *p.guard = 1;
+                fprintf(stderr, "[gt6-patch] %s=legacy  \"%s\" (%s, legacy root+0x1C=0)\n", p.env, p.title, p.author);
+            } else if (e && *e == '1') {
+                *p.guard = 0;
+                g_gt6_unlock_fps = 1;
+                fprintf(stderr, "[gt6-patch] %s=1 -> clean VBlank target unlock (root+0x1C intact)\n", p.env);
+            } else {
+                *p.guard = 0;
+                if (list && !strcmp(list, "list"))
+                    fprintf(stderr, "[gt6-patch] %s=0  \"%s\" (%s)\n", p.env, p.title, p.author);
+            }
+            continue;
+        }
         *p.guard = (e && *e == '1') ? 1 : 0;
         if (*p.guard || (list && !strcmp(list, "list")))
             fprintf(stderr, "[gt6-patch] %s=%d  \"%s\" (%s)\n", p.env, *p.guard, p.title, p.author);

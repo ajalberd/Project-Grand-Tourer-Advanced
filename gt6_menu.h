@@ -54,6 +54,7 @@ struct Settings {
     bool lanMode = false;          // [GT6 0114] LAN play without PSN (from the next start; main.cpp gt6_menu_setting_lan_mode)
     double screenBright = 1.0;     // Brightness (2026-11-24, a player's report: "image is very dim"): the picture goes to the window as
                                    // out = in^(1 / this) - 1 = as the game draws it, live [GT6 0101]
+    int fpsLimit = 0;              // Live FPS limit: 0 = Stock 60 FPS, 90/120/144/240 = unlocked + host paced, -1 = Unlimited
     int menuLang = 0;              // [GT6 0087] 0 = by Windows' display language, 1 = Korean, 2 = English (from the next start)
     int lastPage = 0;
 };

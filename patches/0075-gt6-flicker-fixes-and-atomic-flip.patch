@@ -1,0 +1,175 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 781d12a2..5f3a1855 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -154,9 +154,7 @@ static int gcm_flip_executed_take(void)
+ 
+ int cellGcm_take_flip_pending(void)
+ {
+-    int v = s_flip_pending;
+-    s_flip_pending = 0;
+-    return v;
++    return __atomic_exchange_n(&s_flip_pending, 0, __ATOMIC_ACQ_REL);
+ }
+ 
+ /* The flip now names this buffer. The shared draw engine presents on the
+@@ -164,7 +162,7 @@ int cellGcm_take_flip_pending(void)
+  * keep presenting display buffer 0 for a title that flips through 0xFEAD. */
+ static void gcm_set_current_display_buffer(u32 bufferId)
+ {
+-    s_current_display_buffer_id = bufferId;
++    __atomic_store_n(&s_current_display_buffer_id, bufferId, __ATOMIC_RELEASE);
+     if (rsx_draw_engine_enabled())
+         rsx_draw_engine_note_flip(bufferId);
+ }
+@@ -1754,12 +1752,11 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
+  * and halved the frame rate). Call AFTER draining. */
+ int cellGcm_take_flip_pending_synced(void)
+ {
+-    if (!s_flip_pending) return 0;
++    if (!__atomic_load_n(&s_flip_pending, __ATOMIC_ACQUIRE)) return 0;
+     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+     u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+     if (get != put) return 0;   /* frame not fully drained yet */
+-    s_flip_pending = 0;
+-    return 1;
++    return __atomic_exchange_n(&s_flip_pending, 0, __ATOMIC_ACQ_REL);
+ }
+ 
+ /* ---- fence (SET_REFERENCE) observability ---------------------------------
+@@ -2342,7 +2339,7 @@ static void gcm_wait_note_pass(LONGLONG q0, LONGLONG q1)
+ }
+ static int gcm_walker_has_work(void)
+ {
+-    if (s_flip_pending) return 1;
++    if (__atomic_load_n(&s_flip_pending, __ATOMIC_ACQUIRE)) return 1;
+     if (s_wait_kind == 2u) return s_wait_ea && vm_read32(s_wait_ea) != s_wait_word;
+     if (s_wait_kind == 1u) return s_wait_ea && vm_read32(s_wait_ea) == s_wait_word;
+     const u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+@@ -3140,7 +3137,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 /* Queued by _cellGcmSetFlipCommand, which already did the
+                  * guest-visible half of the request. */
+                 gcm_set_current_display_buffer(w & 7u);
+-                s_flip_pending = 1;
++                __atomic_store_n(&s_flip_pending, 1, __ATOMIC_RELEASE);
+                 s_flip_request_count++;
+                 /* Not past `queued`: a resync may already have written off
+                  * this flip. */
+@@ -4045,7 +4042,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+      * the drain does this half when it reaches it (see the 0xFEAD case). */
+     if (!in_fifo) {
+         gcm_set_current_display_buffer(bufferId);
+-        s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
++        __atomic_store_n(&s_flip_pending, 1, __ATOMIC_RELEASE);   /* ticker: present BEFORE the next drain */
+         s_flip_request_count++;
+         s_flip_direct_pending = 1;
+     }
+@@ -4191,7 +4188,7 @@ CellGcmDisplayInfo* cellGcmGetDisplayBufferByFlipIndex(u32 index)
+ /* NID: 0x8BADE8BE */
+ u32 cellGcmGetCurrentDisplayBufferId(void)
+ {
+-    return s_current_display_buffer_id;
++    return __atomic_load_n(&s_current_display_buffer_id, __ATOMIC_ACQUIRE);
+ }
+ 
+ /* NID: 0xD9B7653E */
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index fde73893..6ca6da67 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -10087,8 +10087,7 @@ static ID3D12PipelineState* get_pso(
+            * coordinates address the resource, so divide by its size: a texture
+            * smaller than the zeta then reads its top-left corner, as it does in
+            * VRAM, instead of a stretched copy of the whole depth buffer. */
+-          if ((ut.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) ==
+-                  TEX_FMT_DEPTH24_D8) {
++          if (ld_tex_reads_depth(ut.format)) {
+               for (u32 zi = 0; zi < g.n_zdepths; zi++) {
+                   const zdepth_t* z = &g.zdepths[zi];
+                   if (z->location != ut.location || z->offset != ut.offset)
+@@ -15507,13 +15506,23 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+          * descriptor actually declares; failing that, the most recently drawn
+          * one, which is the only other defensible answer. */
+         int sampled = -1;
++        /* When SET_TEXTURE_CONTROL1 maps every output channel to a hardware
++         * constant (ZERO or ONE, i.e. no op bit 1 set in bits 8..15), the RSX
++         * sampler never reads texel memory. Aliasing such a bind to a live
++         * surface (whose SRV uses default component mapping without t.remap)
++         * feeds live render-target pixels instead of the constant -- e.g. GT6
++         * Car Presentation binds 1:0:0:85:1x1 with remap=0x0100 (0,0,0,1) on
++         * the showroom stage, which aliased display buffer 0 and flickered
++         * every 3 frames as buffer 0 cycled between cleared-black and lit. */
++        const u32 remap16 = t.remap & 0xFFFFu;
++        const int const_remap = remap16 != 0u && (remap16 & 0xAA00u) == 0u;
+         /* An address can be both a colour target and a zeta (a shadow map
+          * pass that binds the same memory as both, colour writes masked).
+          * A depth-format read of an address with a written host zeta is a
+          * depth read: try the zeta first. Before, the colour surface at the
+          * same address was taken (zeros). */
+         int zeta_pref = 0;
+-        if (ld_tex_reads_depth(t.format))
++        if (!const_remap && ld_tex_reads_depth(t.format))
+             for (u32 i = 0; i < g.n_zdepths; i++)
+                 if (g.zdepths[i].location == t.location &&
+                     g.zdepths[i].offset == t.offset &&
+@@ -15521,7 +15530,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                     zeta_pref = 1;
+                     break;
+                 }
+-        if (!zeta_pref) {
++        if (!zeta_pref && !const_remap) {
+           /* Two host surfaces can stand at one guest address: Gran Turismo 6 uses its scratch surface 0x22C0000 as
+            * A8R8G8B8 (mirror, brightness measurement, final glare picture) and as W16Z16Y16X16 float (glare
+            * passes), and each format has a host surface of its own. A texture reads the one that holds texels of
+@@ -15669,7 +15678,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 fprintf(stderr, "\n");
+             }
+         }
+-        if (sampled < 0 && !zeta_pref && g.surfaces[target].location == t.location &&
++        if (sampled < 0 && !zeta_pref && !const_remap && g.surfaces[target].location == t.location &&
+             g.surfaces[target].offset == t.offset) {
+             /* Reads its own render target: sample a copy of it.
+              * A texture smaller than the target reads the target's top-left texels, as it does on any other
+@@ -15682,10 +15691,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             if (fbw < 0) { const char* e = getenv("LD_FEEDBACK_WINDOW"); fbw = (e && *e == '0') ? 0 : 1; }
+             const int fw = fbw ? surface_window(target, &t, LD_DIAG_ENABLED("LD_ALIAS_DBG")) : -1;
+             const int fb_mode = ld_feedback_per_pass_mode();
++            /* Restrict per-pass feedback reuse in mode 1 to depth-tested 3D
++             * passes only: blended / multi-quad 2D UI and post-process passes
++             * (M_DEPTH_TEST_ENABLE == 0) can sequentially read back their own
++             * render target and flicker if given a stale pass snapshot. */
+             const int fb_allow_pass = fb_mode == 2 ||
+-                (fb_mode == 1 && ((rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0u ||
+-                                  (rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u) != 0u ||
+-                                  n_tri > 6u));
++                (fb_mode == 1 && (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0u);
+             slots[u] = fw >= 0 ? (u32)fw : surface_feedback_srv_ex(target, 0, fb_allow_pass);
+             g_ld_bind_surf++;
+             if (g_ld_fb_bound_n < 4) {
+@@ -15693,7 +15704,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 g_ld_fb_bound[g_ld_fb_bound_n].k = fw >= 0 ? g_ld_swin_last_k : LD_SWIN_PER;
+                 g_ld_fb_bound_n++;
+             }
+-        } else if (sampled < 0 && !zeta_pref && ld_seq_feedback_on() && !t.cubemap && t.dimension == 2u &&
++        } else if (sampled < 0 && !zeta_pref && !const_remap && ld_seq_feedback_on() && !t.cubemap && t.dimension == 2u &&
+                    (t.format & TEX_FMT_LINEAR) && g.surfaces[target].tex &&
+                    ((g.surfaces[target].fmt == DXGI_FORMAT_R8G8B8A8_UNORM && ld_tex_texel_bytes(t.format) == 4u) ||
+                     (g.surfaces[target].fmt == DXGI_FORMAT_R16G16B16A16_FLOAT && ld_tex_texel_bytes(t.format) == 8u)) &&
+@@ -15755,7 +15766,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             /* Mirror the replay-proven depth-RT contract: address and format
+              * must match, and the pass must have executed a depth-writing draw.
+              * Clear-only zetas intentionally fall through to guest VRAM. */
+-            if (ld_tex_reads_depth(t.format))
++            if (!const_remap && ld_tex_reads_depth(t.format))
+                 for (u32 i = 0; i < g.n_zdepths; i++)
+                     if (g.zdepths[i].location == t.location &&
+                         g.zdepths[i].offset == t.offset &&
+@@ -15810,7 +15821,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+              * Not for a pass that writes no colour -- the stencil fills leave the texture bound, and each of them
+              * would fill the view again. */
+             u32 zs_slot = 0;
+-            if (sampled_depth < 0 && texture_base_fmt == TEX_FMT_A8R8G8B8 && rsx_dsp_reg(&g.rsx, M_COLOR_MASK))
++            if (!const_remap && sampled_depth < 0 && texture_base_fmt == TEX_FMT_A8R8G8B8 && rsx_dsp_reg(&g.rsx, M_COLOR_MASK))
+                 for (u32 i = 0; i < g.n_zdepths; i++)
+                     if (g.zdepths[i].tex && g.zdepths[i].location == t.location &&
+                         g.zdepths[i].offset == t.offset) {

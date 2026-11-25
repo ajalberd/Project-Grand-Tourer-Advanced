@@ -46,6 +46,8 @@ extern float g_gt6_aspect;
 extern float rsx_live_draw_present_aspect;
 extern float rsx_window_aspect;
 extern int rsx_live_draw_present_stretch;
+extern int rsx_live_draw_present_max_fps;
+extern volatile int g_gt6_unlock_fps;
 int gt6_res_1080(void);     /* main.cpp: 1 = this run is in the game's 1080p mode */
 int gt6_real_res(void);     /* main.cpp [GT6 0102]: this run's real resolution (Settings::realRes, 0 = off) */
 int gt6_lan_mode(void);     /* main.cpp [GT6 0114]: this run is in LAN mode */
@@ -850,6 +852,34 @@ void pageSettings(Settings& s)
                     rsx_live_draw_present_aspect = kAspects[i];
                     rsx_window_aspect = kAspects[i];
                     if (kAspects[i] > 0.5f) rsx_live_draw_present_stretch = 1;
+                }
+                ImGui::PopID();
+            }
+        }
+        // Live FPS limit (clean VBlank target unlock + host present pacing / ALLOW_TEARING)
+        {
+            rowLabel(gt6_tr_english() ? "FPS limit (live)" : "프레임 제한 (바로 적용)",
+                     gt6_tr_english() ? "Unlocks racing past 60 FPS while keeping menus, 30 FPS scenes, animations, physics, and LOD at normal 1x speed. Applies immediately."
+                                      : "메뉴·30 FPS 장면·애니메이션·물리·LOD 속도를 정상 1배속으로 유지하면서 레이스의 60 FPS 제한을 해제합니다. 바로 적용됩니다.");
+            static const int kFpsVals[6] = { 0, 90, 120, 144, 240, -1 };
+            const char* kFpsNames[6] = {
+                gt6_tr_english() ? "60 (Stock)" : "60 (기본)",
+                "90", "120", "144", "240",
+                gt6_tr_english() ? "Unlimited" : "무제한"
+            };
+            const int curLimit = g_gt6_unlock_fps ? rsx_live_draw_present_max_fps : 0;
+            const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 5) / 6.0f;
+            for (int i = 0; i < 6; i++) {
+                if (i) ImGui::SameLine();
+                ImGui::PushID(970 + i);
+                const bool active = (kFpsVals[i] == 0) ? (curLimit == 0)
+                                  : (kFpsVals[i] < 0)  ? (curLimit < 0)
+                                                       : (curLimit == kFpsVals[i]);
+                if (button(kFpsNames[i], active ? 1 : 2, std::floor(w))) {
+                    s.fpsLimit = kFpsVals[i];
+                    g_gt6_unlock_fps = (kFpsVals[i] != 0) ? 1 : 0;
+                    rsx_live_draw_present_max_fps = kFpsVals[i];
+                    U.dirty = true;
                 }
                 ImGui::PopID();
             }

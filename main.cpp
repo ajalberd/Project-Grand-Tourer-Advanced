@@ -165,8 +165,11 @@ static int g_gt6_res_1080 = 0;
 extern "C" int gt6_menu_setting_full_hd(void);      /* gt6_menu_engine.cpp */
 extern "C" int rsx_live_draw_present_stretch;       /* rsx_live_draw.c: the scanout is stretched over the window */
 extern "C" float rsx_live_draw_present_aspect;      /* rsx_live_draw.c: custom display aspect ratio (0 = 16:9) */
+extern "C" int rsx_live_draw_present_max_fps;       /* rsx_live_draw.c: 0 = vsync, -1 = unlimited, 30..1000 = paced Hz */
 extern "C" float rsx_window_aspect;                 /* rsx_null_backend.c: custom window aspect ratio (0 = 16:9) */
 extern "C" float g_gt6_aspect;                      /* gt6_host.cpp: 3D projection aspect override at 0x008A615C */
+extern "C" volatile int g_gt6_unlock_fps;           /* gt6_frame_timing.h: 1 = clean VBlank target unlock */
+extern "C" int gt6_menu_setting_fps_limit(void);    /* gt6_menu_engine.cpp */
 extern "C" void rsx_live_draw_upscale(float ux, float uy);       /* rsx_live_draw.c [GT6 0102] */
 extern "C" void rsx_live_draw_upscale_size(unsigned w, unsigned h);
 extern "C" int gt6_res_1080(void) { return g_gt6_res_1080; }   /* (the menu shows which mode this run is in) */
@@ -1153,6 +1156,30 @@ int main(int argc, char** argv)
                 fprintf(stderr, "[gt6] real resolution %ux%u (%s): the game's 1440x1080 buffers are that large on the host\n", uw, uh,
                         up && *up ? "GT6_UPSCALE" : "the F2 menu's switch");
             } }
+      } }
+
+    /* Clean FPS unlock & host present limit: env vars take precedence, else F2 menu's saved ScreenFpsLimit. */
+    { const char* e_fps = getenv("LD_PRESENT_MAX_FPS");
+      const char* e_unl = getenv("GT6_PATCH_UNLOCK_FPS");
+      const char* e_int = getenv("GT6_RENDER_INTERVAL");
+      if (e_fps && *e_fps) {
+          int lim = 0;
+          if (_stricmp(e_fps, "unlimited") == 0 || _stricmp(e_fps, "off") == 0 || atoi(e_fps) < 0) lim = -1;
+          else { int v = atoi(e_fps); lim = v >= 30 ? (v > 1000 ? 1000 : v) : 0; }
+          rsx_live_draw_present_max_fps = lim;
+          if (lim != 0 && !(e_unl && *e_unl == '0') && !(e_int && *e_int))
+              g_gt6_unlock_fps = 1;
+      } else if (e_unl && *e_unl == '1') {
+          g_gt6_unlock_fps = 1;
+          rsx_live_draw_present_max_fps = -1;
+      } else if (!(e_int && *e_int)) {
+          const int saved = gt6_menu_setting_fps_limit();
+          if (saved != 0) {
+              g_gt6_unlock_fps = 1;
+              rsx_live_draw_present_max_fps = saved;
+              if (saved < 0) fprintf(stderr, "[gt6] FPS limit from F2 menu: Unlimited\n");
+              else fprintf(stderr, "[gt6] FPS limit from F2 menu: %d Hz\n", saved);
+          }
       } }
 
     printf("=== GT6 native port (ps3recomp) ===\n");

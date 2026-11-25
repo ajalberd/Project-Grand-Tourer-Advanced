@@ -33,6 +33,8 @@
 extern "C" {
 extern uint8_t* vm_base;
 extern float rsx_live_draw_present_gamma;   /* rsx_live_draw.c [GT6 0101]: the present's exponent, out = in^g */
+extern int rsx_live_draw_present_max_fps;   /* rsx_live_draw.c: 0 = vsync, -1 = unlimited, 30..1000 = paced Hz */
+extern volatile int g_gt6_unlock_fps;       /* gt6_frame_timing.h: 1 = clean VBlank target unlock */
 }
 
 // ---- [GT6 0087] the menu's language (see gt6_menu.h) ----------------------------------------------------------
@@ -799,6 +801,7 @@ std::string settingsToJson(const Settings& s)
     w.kv("MenuFullHd", s.fullHd);
     w.kv("ScreenRealRes", s.realRes);
     w.kv("ScreenBright", s.screenBright);
+    w.kv("ScreenFpsLimit", s.fpsLimit);
     w.kv("CameraLooseChase", s.camLoose);
     w.kv("CameraChaseSpring", s.camSpring);
     w.kv("CameraChaseAngle", s.camAngle);
@@ -866,6 +869,10 @@ void settingsFromJson(const J& j, Settings& s, bool menuKeys)
         I("ScreenRealRes", s.realRes);
         s.realRes = std::clamp(s.realRes, 0, 3);
         D("ScreenBright", s.screenBright);
+        I("ScreenFpsLimit", s.fpsLimit);
+        if (s.fpsLimit < -1) s.fpsLimit = -1;
+        else if (s.fpsLimit > 0 && s.fpsLimit < 30) s.fpsLimit = 0;
+        else if (s.fpsLimit > 1000) s.fpsLimit = 1000;
         B("CameraLooseChase", s.camLoose);
         D("CameraChaseSpring", s.camSpring);
         s.camSpring = std::clamp(std::isfinite(s.camSpring) ? s.camSpring : 90.0, 0.0, 300.0);
@@ -916,6 +923,25 @@ extern "C" int gt6_menu_setting_real_res(void)
         if (!x || x->t != J::Num) return 0;
         const int v = (int)x->n;
         return v >= 0 && v <= 3 ? v : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Live FPS limit (Settings -> Screen -> FPS limit): 0 = Stock 60 FPS, -1 = Unlimited, 30..1000 = unlocked + host paced.
+extern "C" int gt6_menu_setting_fps_limit(void)
+{
+    try {
+        std::string text;
+        J j;
+        if (!readFile(settingsPath(), text) || !jsonParse(text, j) || j.t != J::Obj)
+            return 0;
+        const J* x = j.get("ScreenFpsLimit");
+        if (!x || x->t != J::Num) return 0;
+        const int v = (int)std::llround(x->n);
+        if (v < 0) return -1;
+        if (v >= 30 && v <= 1000) return v;
+        return 0;
     } catch (...) {
         return 0;
     }
@@ -1620,6 +1646,16 @@ struct Engine {
     void run()
     {
         loadSettings();
+        int lastAppliedFps = -999;
+        {
+            const char* e1 = std::getenv("GT6_PATCH_UNLOCK_FPS");
+            const char* e2 = std::getenv("LD_PRESENT_MAX_FPS");
+            const char* e3 = std::getenv("GT6_RENDER_INTERVAL");
+            if ((e1 && *e1) || (e2 && *e2) || (e3 && *e3)) {
+                std::lock_guard<std::mutex> lk(g_mx);
+                lastAppliedFps = g_set.fpsLimit;   /* keep env override until user changes it in F2 */
+            }
+        }
         uint64_t lastFast = 0, lastSlow = 0;
         for (;;) {
             Sleep(25);
@@ -1641,6 +1677,11 @@ struct Engine {
             }
             // [GT6 0101] Brightness (Settings -> Display), live: the presenter draws the picture as out = in^(1 / b)
             rsx_live_draw_present_gamma = (float)(1.0 / std::clamp(std::isfinite(s.screenBright) ? s.screenBright : 1.0, 0.5, 2.0));
+            if (s.fpsLimit != lastAppliedFps) {
+                lastAppliedFps = s.fpsLimit;
+                g_gt6_unlock_fps = (s.fpsLimit != 0) ? 1 : 0;
+                rsx_live_draw_present_max_fps = s.fpsLimit;
+            }
             cameraTick(s);
             control(now, s);
             std::vector<Command> cmds;

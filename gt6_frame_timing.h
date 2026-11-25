@@ -68,26 +68,65 @@ struct Gt6FrameTimingStats {
 };
 } // namespace
 
+extern "C" volatile int g_gt6_unlock_fps = 0;
+
 extern "C" void gt6_render_wait_target(ppu_context* ctx)
 {
-    const Gt6FrameTimingConfig& config = gt6_frame_timing_config();
-    if (config.interval < 0 || !ctx || ctx->lr != 0x008A8A48u || ctx->gpr[5] != 1)
+    int target_interval = gt6_frame_timing_config().interval;
+    if (target_interval < 0 && g_gt6_unlock_fps)
+        target_interval = 0;
+    if (target_interval < 0 || !ctx || ctx->lr != 0x008A8A48u || ctx->gpr[5] != 1)
         return;
     Gt6FrameTimingSample sample;
     if (!gt6_frame_timing_sample(sample) || ctx->gpr[3] != sample.graphics ||
         ctx->gpr[31] != sample.graphics || ctx->gpr[9] != sample.root ||
         ctx->gpr[0] != sample.previous_vblank || sample.interval < 1 ||
-        sample.interval > 2 || config.interval >= sample.interval ||
+        sample.interval > 2 || target_interval >= sample.interval ||
         sample.previous_vblank > UINT64_MAX - (uint32_t)sample.interval ||
         ctx->gpr[4] != sample.previous_vblank + (uint32_t)sample.interval)
         return;
     /* The guest still executes its complete condvar / flip wait. Only its
      * requested VBlank target changes; all other registers/data are intact. */
-    ctx->gpr[4] = sample.previous_vblank + (uint32_t)config.interval;
+    ctx->gpr[4] = sample.previous_vblank + (uint32_t)target_interval;
     static thread_local bool reported = false;
     if (!reported) {
-        fprintf(stderr, "[gt6-render-interval] experimental wait target %d -> %d; "
-                "guest interval and VBlank clock unchanged\n", sample.interval, config.interval);
+        fprintf(stderr, "[gt6-fps-unlock] render wait target interval %d -> %d; "
+                "guest root+0x1C and VBlank clock unchanged\n", sample.interval, target_interval);
+        reported = true;
+    }
+}
+
+void gt6_flip_target_vblank(ppu_context* ctx)
+{
+    /* Only opt-in via GT6_UNLOCK_ALL_SCENES=1: GT6's menus, loading screens,
+     * and 30 FPS car-presentation scenes step UI/camera animations per frame
+     * and run 6-11x too fast if func_008A5EC8 is unlocked. Racing uses
+     * gt6_render_wait_target (0x008A8A48) with real delta-time physics. */
+    static int unlock_all_scenes = -1;
+    if (unlock_all_scenes < 0) {
+        const char* e = getenv("GT6_UNLOCK_ALL_SCENES");
+        unlock_all_scenes = (e && *e == '1') ? 1 : 0;
+    }
+    if (!unlock_all_scenes)
+        return;
+    int target_interval = gt6_frame_timing_config().interval;
+    if (target_interval < 0 && g_gt6_unlock_fps)
+        target_interval = 0;
+    if (target_interval < 0 || !ctx)
+        return;
+    Gt6FrameTimingSample sample;
+    if (!gt6_frame_timing_sample(sample) ||
+        ctx->gpr[31] != sample.graphics ||
+        ctx->gpr[9] != sample.root ||
+        sample.interval < 1 || sample.interval > 2 ||
+        target_interval >= sample.interval)
+        return;
+    const int64_t delta = (int64_t)(int32_t)ctx->gpr[28] * (int64_t)target_interval;
+    ctx->gpr[0] = ctx->gpr[27] + (uint64_t)delta;
+    static thread_local bool reported = false;
+    if (!reported) {
+        fprintf(stderr, "[gt6-fps-unlock] flip schedule target interval %d -> %d "
+                "(GT6_UNLOCK_ALL_SCENES=1, root+0x1C intact)\n", sample.interval, target_interval);
         reported = true;
     }
 }
